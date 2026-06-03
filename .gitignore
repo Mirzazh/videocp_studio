@@ -27,6 +27,7 @@ __pycache__/
 *.pyd
 dist/
 build/
+.build/
 *.egg-info/
 *.part
 *.tmp
@@ -35,5 +36,12 @@ build/
 downloads/
 uv.lock
 output/**
+mac-app.json
+mac-tasks.yaml
+publish_history*.json
 sync_history*.json
 sync_logs/**
+release/.DS_Store
+release/Videocp Studio/
+
+release/*.zip

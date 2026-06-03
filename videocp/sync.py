@@ -5,6 +5,7 @@ import random
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
 from videocp.app import (
     DownloadOptions,
@@ -141,8 +142,11 @@ def _sync_one_task(
         if not parsed.is_profile:
             expanded = [parsed]
         else:
+            # Fetch a small buffer beyond the requested count so that one bad
+            # or already-processed video does not block the whole source.
+            expand_count = count + 3 if count > 0 else count
             expanded = _expand_profile_inputs(
-                [parsed], browser_config, profile_videos_count=count, timeout_secs=app_cfg.timeout_secs,
+                [parsed], browser_config, profile_videos_count=expand_count, timeout_secs=app_cfg.timeout_secs,
             )
 
         if not expanded:
@@ -150,6 +154,7 @@ def _sync_one_task(
             return [SyncTaskResult(task_name=task.name, ok=True, action="no_new_video")]
 
         # Process each expanded video
+        completed = 0
         for video_input in expanded:
             result = _sync_one_video(
                 task=task,
@@ -161,6 +166,10 @@ def _sync_one_task(
                 dry_run=dry_run,
             )
             results.append(result)
+            if result.action in ("synced", "synced_pinned", "dry_run"):
+                completed += 1
+            if count > 0 and completed >= count:
+                break
 
     except Exception as exc:
         log_warn("sync.task.failed", task=task.name, error=str(exc))
@@ -306,7 +315,9 @@ def _sync_one_video(
             video_title = meta.title if meta else ""
             actual_content_id = meta.content_id if meta else content_id
 
-        # Publish via configured method. Skill uploads now use author identity globally.
+        # Publish via configured method. For the official tencent-channel-cli
+        # skill, blank guild/channel means author-global posting; nonblank
+        # guild/channel posts inside that channel section.
         publish_method = task.publish_method or sync_cfg.publish_method
         template_vars = {"site": site, "author": author, "desc": desc, "title": video_title, "content_id": actual_content_id}
         title = task.title_template.format_map(_SafeFormatMap(template_vars))
@@ -352,8 +363,8 @@ def _sync_one_video(
             pub_result = publish_to_channel(
                 skill_dir=sync_cfg.skill_dir,
                 video_path=output_path,
-                guild_id="",
-                channel_id="",
+                guild_id=task.guild_id,
+                channel_id=task.channel_id,
                 title=title,
                 content=content,
                 feed_type=task.feed_type,
@@ -398,11 +409,18 @@ def _sync_one_video(
 
 def _find_existing_download(output_dir: Path, content_id: str) -> dict | None:
     """Check if a video with this content_id was already downloaded (by looking at sidecar JSONs)."""
-    for sidecar in output_dir.rglob(f"{content_id}.json"):
+    if not output_dir.exists():
+        return None
+    requested_ids = _content_id_candidates(content_id)
+    for sidecar in output_dir.rglob("*.json"):
         try:
             data = json.loads(sidecar.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             data = {}
+        sidecar_ids = _content_id_candidates(sidecar.stem)
+        sidecar_ids.update(_content_id_candidates(str(data.get("content_id", ""))))
+        if requested_ids.isdisjoint(sidecar_ids):
+            continue
         video_path_value = data.get("output_path", "")
         video = Path(video_path_value) if isinstance(video_path_value, str) and video_path_value else sidecar.with_suffix(".mp4")
         if not video.is_absolute():
@@ -417,6 +435,25 @@ def _find_existing_download(output_dir: Path, content_id: str) -> dict | None:
                 "content_id": data.get("content_id", content_id),
             }
     return None
+
+
+def _content_id_candidates(content_id: str) -> set[str]:
+    candidates: set[str] = set()
+    raw = str(content_id or "").strip()
+    if not raw:
+        return candidates
+    for value in {raw, unquote(raw)}:
+        cleaned = value.strip().split("?", 1)[0].rstrip("/")
+        if not cleaned:
+            continue
+        candidates.add(cleaned)
+        name = Path(cleaned).name
+        if name:
+            candidates.add(name)
+            stem = Path(name).stem
+            if stem:
+                candidates.add(stem)
+    return candidates
 
 
 def _extract_content_id(url: str) -> str:
@@ -441,6 +478,7 @@ def _is_skippable_download_error(error: str) -> bool:
         "members-only" in normalized
         or "member-only" in normalized
         or "会员专享" in normalized
+        or "requested format is not available" in normalized
         or "join this channel to get access to members-only content" in normalized
     )
 

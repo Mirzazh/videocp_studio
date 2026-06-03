@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from videocp.bbdown import download_bilibili_with_bbdown
 from videocp.browser import BrowserConfig, open_download_browser_session
@@ -17,6 +17,7 @@ from videocp.downloader import (
     build_output_subdir,
     build_output_stem,
     download_best_candidate,
+    probe_video_dimensions,
     sanitize_filename,
 )
 from videocp.errors import DownloadError
@@ -36,7 +37,13 @@ from videocp.models import (
 from videocp.profile import default_profile_dir, detect_system_browser_executable
 from videocp.profile_expander import INSTAGRAM_PROFILE_RE, expand_profile
 from videocp.runtime_log import full_url, log_info, log_warn
-from videocp.ytdlp import download_with_ytdlp, expand_ytdlp_playlist, fetch_ytdlp_metadata, write_netscape_cookies
+from videocp.ytdlp import download_with_ytdlp, expand_ytdlp_playlist, fetch_ytdlp_metadata
+
+YOUTUBE_COOKIE_HELP = (
+    "YouTube 需要 Cookie：请在 App 的下载页粘贴有效的 YouTube cookies.txt 内容。"
+    "建议用隐身窗口登录 YouTube，打开 https://www.youtube.com/robots.txt 后导出 youtube.com Cookie。"
+)
+YTDLP_DOWNLOAD_TIMEOUT_SECS = 300
 
 
 @dataclass(slots=True)
@@ -53,6 +60,12 @@ class DownloadOptions:
     start_interval_secs: float = 0.0
     watermark: WatermarkConfig | None = None
     profile_videos_count: int = 3
+    profile_order: str = "latest"
+    ytdlp_extractor_args: str = ""
+    ytdlp_cookies_file: Path | None = None
+    ytdlp_remote_components: bool = False
+    skip_content_ids: set[str] | None = None
+    force_redownload: bool = False
 
 
 @dataclass(slots=True)
@@ -77,6 +90,88 @@ class DoctorOptions:
     login_urls: list[str] | None = None
 
 
+def _content_id_candidates(content_id: str) -> set[str]:
+    candidates: set[str] = set()
+    raw = str(content_id or "").strip()
+    if not raw:
+        return candidates
+    cleaned = raw.split("?", 1)[0].rstrip("/")
+    if cleaned:
+        candidates.add(cleaned)
+        name = Path(cleaned).name
+        if name:
+            candidates.add(name)
+            stem = Path(name).stem
+            if stem:
+                candidates.add(stem)
+    return candidates
+
+
+def _extract_content_id_from_url(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    video_ids = parse_qs(parsed.query).get("v")
+    if video_ids:
+        return video_ids[0]
+    for part in reversed(parsed.path.rstrip("/").split("/")):
+        if part and len(part) > 2:
+            return part
+    return str(url or "")
+
+
+def _exclude_processed_inputs(prepared_inputs: list[ParsedInput], content_ids: set[str] | None) -> list[ParsedInput]:
+    if not content_ids:
+        return prepared_inputs
+    processed_candidates: set[str] = set()
+    for content_id in content_ids:
+        processed_candidates.update(_content_id_candidates(content_id))
+    pending: list[ParsedInput] = []
+    for item in prepared_inputs:
+        content_id = _extract_content_id_from_url(item.canonical_url)
+        if not _content_id_candidates(content_id).isdisjoint(processed_candidates):
+            log_info("job.download.skip_history", content_id=content_id, url=full_url(item.canonical_url))
+            continue
+        pending.append(item)
+    return pending
+
+
+def _find_existing_download(output_dir: Path, content_id: str) -> dict | None:
+    if not output_dir.exists():
+        return None
+    requested_ids = _content_id_candidates(content_id)
+    if not requested_ids:
+        return None
+    for sidecar in output_dir.rglob("*.json"):
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+        sidecar_ids = _content_id_candidates(sidecar.stem)
+        sidecar_ids.update(_content_id_candidates(str(data.get("content_id", ""))))
+        if requested_ids.isdisjoint(sidecar_ids):
+            continue
+        video_path_value = data.get("output_path", "")
+        video = Path(video_path_value) if isinstance(video_path_value, str) and video_path_value else sidecar.with_suffix(".mp4")
+        if not video.is_absolute():
+            video = (sidecar.parent / video).resolve()
+        if video.is_file():
+            if video.stat().st_size < 1024:
+                continue
+            width, height = probe_video_dimensions(video)
+            if width <= 0 or height <= 0:
+                continue
+            return {"output_path": video, "sidecar_path": sidecar, "data": data}
+    return None
+
+
+def _artifact_from_existing(existing: dict, candidate: MediaCandidate) -> DownloadArtifact:
+    return DownloadArtifact(
+        output_path=existing["output_path"],
+        sidecar_path=existing["sidecar_path"],
+        chosen_candidate=candidate,
+        attempts=[{"url": str(existing["output_path"]), "mode": "reuse", "status": "ok"}],
+    )
+
+
 def _raise_if_duration_exceeds_limit(extraction: ExtractionResult, max_duration_secs: int) -> None:
     if max_duration_secs <= 0 or extraction.metadata.duration_ms <= 0:
         return
@@ -94,6 +189,33 @@ def _raise_if_duration_exceeds_limit(extraction: ExtractionResult, max_duration_
         "video duration exceeds limit: "
         f"duration_secs={duration_secs:.1f} max_video_duration_secs={max_duration_secs}"
     )
+
+
+def _is_ytdlp_setup_error(error: str) -> bool:
+    normalized = str(error or "").lower()
+    return (
+        "youtube 已返回视频标题" in str(error or "")
+        or "youtube 需要 cookie" in str(error or "").lower()
+        or "sign in to confirm" in normalized
+        or "requested format is not available" in normalized
+        or "no video formats" in normalized
+        or "only images are available" in normalized
+    )
+
+
+def _is_timeout_error(error: object) -> bool:
+    normalized = str(error or "").lower()
+    return "timed out" in normalized or "timeout" in normalized or "超时" in normalized
+
+
+def _youtube_error_message(exc: object) -> str:
+    if _is_timeout_error(exc):
+        return (
+            "YouTube 下载超时：网络较慢、视频较大或 YouTube 响应太慢。"
+            "App 已把下载超时提升到 5 分钟；如果仍失败，请稍后重试、换网络，或确认 Cookie 没有过期。"
+            f" 原始错误: {exc}"
+        )
+    return f"{YOUTUBE_COOKIE_HELP} 原始错误: {exc}"
 
 
 class StartIntervalGate:
@@ -167,6 +289,10 @@ def _expand_profile_inputs(
     browser_config: BrowserConfig,
     profile_videos_count: int,
     timeout_secs: int,
+    profile_order: str = "latest",
+    ytdlp_cookies_file: Path | None = None,
+    ytdlp_extractor_args: str = "",
+    ytdlp_remote_components: bool = False,
 ) -> list[ParsedInput]:
     """Separate profile inputs from video inputs, expand profiles to video URLs."""
     profile_inputs = [item for item in prepared_inputs if item.is_profile]
@@ -244,26 +370,54 @@ def _expand_profile_inputs(
 
         # Other yt-dlp profiles: playlist expansion via yt-dlp
         if other_ytdlp_profiles:
-            cookies: list[dict] = []
-            with open_download_browser_session(browser_config) as browser:
-                cookies = browser.get_cookies()
-            cookies_file: Path | None = None
-            temp_dir = tempfile.mkdtemp(prefix="videocp-ytdlp-expand-")
-            if cookies:
-                cookies_file = Path(temp_dir) / "cookies.txt"
-                write_netscape_cookies(cookies, cookies_file)
             for profile_input in other_ytdlp_profiles:
-                result = expand_ytdlp_playlist(
-                    url=profile_input.canonical_url,
-                    max_videos=profile_videos_count,
-                    cookies_file=cookies_file,
-                )
+                try:
+                    result = expand_ytdlp_playlist(
+                        url=profile_input.canonical_url,
+                        max_videos=profile_videos_count,
+                        cookies_file=ytdlp_cookies_file,
+                        order=profile_order,
+                        extractor_args=ytdlp_extractor_args,
+                        remote_components=ytdlp_remote_components,
+                    )
+                except DownloadError as exc:
+                    if "youtube" in profile_input.canonical_url.lower():
+                        raise DownloadError(f"{YOUTUBE_COOKIE_HELP} 原始错误: {exc}") from exc
+                    if "space.bilibili.com" in profile_input.canonical_url.lower():
+                        log_warn("profile.expand.ytdlp_fallback_browser", site="bilibili", error=str(exc))
+                        if profile_order == "popular":
+                            log_warn(
+                                "profile.expand.bilibili_popular_fallback_latest",
+                                message="B站热度排序依赖空间接口，接口不可用时浏览器回退只能按页面展示顺序下载",
+                            )
+                        with open_download_browser_session(browser_config) as browser:
+                            page = browser.new_page()
+                            try:
+                                native_result = expand_profile(
+                                    page=page,
+                                    profile_url=profile_input.canonical_url,
+                                    max_videos=profile_videos_count,
+                                    timeout_secs=timeout_secs,
+                                )
+                            finally:
+                                page.close()
+                        for url in native_result.video_urls:
+                            expanded.append(ParsedInput(
+                                raw_input=url,
+                                extracted_url=url,
+                                canonical_url=url,
+                                provider_key="bilibili",
+                                author_hint=native_result.author,
+                            ))
+                        continue
+                    raise
                 for url in result.video_urls:
+                    provider_key = "bilibili" if "bilibili.com/video/" in url.lower() else "ytdlp"
                     expanded.append(ParsedInput(
                         raw_input=url,
                         extracted_url=url,
                         canonical_url=url,
-                        provider_key="ytdlp",
+                        provider_key=provider_key,
                         author_hint=result.uploader,
                     ))
 
@@ -324,98 +478,123 @@ def _download_ytdlp_input(
     output_dir: Path,
     timeout_secs: int,
     max_video_duration_secs: int = 0,
+    extractor_args: str = "",
+    cookies_file: Path | None = None,
+    remote_components: bool = False,
+    force_redownload: bool = False,
 ) -> tuple[ExtractionResult, DownloadArtifact]:
-    """Download a video via yt-dlp, using cookies from the CDP browser."""
-    # Get cookies from the browser session
+    """Download a video via yt-dlp, optionally using a user-provided cookies.txt file."""
+    del browser_config
     cookies: list[dict] = []
-    with open_download_browser_session(browser_config) as browser:
-        cookies = browser.get_cookies()
 
-    # Fetch metadata from yt-dlp
-    with tempfile.TemporaryDirectory(prefix="videocp-ytdlp-") as temp_dir_raw:
-        temp_dir = Path(temp_dir_raw)
-        cookies_file = temp_dir / "cookies.txt"
-        if cookies:
-            write_netscape_cookies(cookies, cookies_file)
-        else:
-            cookies_file = None
-
-        meta = fetch_ytdlp_metadata(parsed.canonical_url, cookies_file)
-
-        # Build extraction result for consistent output
-        site = meta.site or sanitize_filename(parsed.canonical_url.split("/")[2])
-        metadata = VideoMetadata(
-            source_url=parsed.canonical_url,
-            site=site,
-            canonical_url=parsed.canonical_url,
-            page_url=parsed.canonical_url,
-            aweme_id=meta.id,
-            author=meta.uploader,
-            desc=meta.title,
-            title=meta.title,
-            duration_ms=int(meta.duration_secs * 1000) if meta.duration_secs > 0 else 0,
+    is_youtube_url = "youtube.com" in parsed.canonical_url.lower() or "youtu.be" in parsed.canonical_url.lower()
+    try:
+        meta = fetch_ytdlp_metadata(
+            parsed.canonical_url,
+            cookies_file,
+            extractor_args=extractor_args,
+            remote_components=remote_components,
         )
-        candidate = MediaCandidate(
-            url=parsed.canonical_url,
-            kind=MediaKind.MP4,
-            track_type=TrackType.MUXED,
-            watermark_mode=WatermarkMode.NO_WATERMARK,
-            source="ytdlp",
-            observed_via="ytdlp",
-            note=f"yt-dlp: {meta.title}",
-        )
-        extraction = ExtractionResult(
-            metadata=metadata,
-            candidates=[candidate],
-            cookies=cookies,
-            user_agent="",
-            diagnostics={"downloader": "ytdlp", "ytdlp_id": meta.id, "ytdlp_site": meta.site},
+    except DownloadError as exc:
+        if is_youtube_url:
+            raise DownloadError(_youtube_error_message(exc)) from exc
+        raise
+    if meta.site == "youtube" and meta.formats_count == 0:
+        raise DownloadError(
+            f"{YOUTUBE_COOKIE_HELP} yt-dlp 已识别视频标题，但没有返回可下载的视频格式。"
         )
 
-        # Allocate output path
-        _raise_if_duration_exceeds_limit(extraction, max_video_duration_secs)
-        subdir = build_output_subdir(extraction)
-        stem = build_output_stem(extraction)
-        output_path = allocate_output_path(output_dir, subdir, stem)
-        sidecar_path = output_path.with_suffix(".json")
+    # Build extraction result for consistent output
+    site = meta.site or sanitize_filename(parsed.canonical_url.split("/")[2])
+    metadata = VideoMetadata(
+        source_url=parsed.canonical_url,
+        site=site,
+        canonical_url=parsed.canonical_url,
+        page_url=parsed.canonical_url,
+        aweme_id=meta.id,
+        author=meta.uploader,
+        desc=meta.title,
+        title=meta.title,
+        duration_ms=int(meta.duration_secs * 1000) if meta.duration_secs > 0 else 0,
+    )
+    candidate = MediaCandidate(
+        url=parsed.canonical_url,
+        kind=MediaKind.MP4,
+        track_type=TrackType.MUXED,
+        watermark_mode=WatermarkMode.NO_WATERMARK,
+        source="ytdlp",
+        observed_via="ytdlp",
+        note=f"yt-dlp: {meta.title}",
+    )
+    extraction = ExtractionResult(
+        metadata=metadata,
+        candidates=[candidate],
+        cookies=cookies,
+        user_agent="",
+        diagnostics={"downloader": "ytdlp", "ytdlp_id": meta.id, "ytdlp_site": meta.site},
+    )
 
-        # Download
+    existing = None if force_redownload else _find_existing_download(output_dir, metadata.content_id)
+    if existing:
+        log_info(
+            "job.download.reuse",
+            site=metadata.site,
+            content_id=metadata.content_id or "unknown",
+            output=existing["output_path"],
+        )
+        return extraction, _artifact_from_existing(existing, candidate)
+
+    # Allocate output path
+    _raise_if_duration_exceeds_limit(extraction, max_video_duration_secs)
+    subdir = build_output_subdir(extraction)
+    stem = build_output_stem(extraction)
+    output_path = allocate_output_path(output_dir, subdir, stem)
+    sidecar_path = output_path.with_suffix(".json")
+
+    # Download
+    try:
         download_with_ytdlp(
             url=parsed.canonical_url,
             output_path=output_path,
             cookies_file=cookies_file,
-            timeout_secs=timeout_secs,
+            timeout_secs=max(timeout_secs, YTDLP_DOWNLOAD_TIMEOUT_SECS),
+            extractor_args=extractor_args,
+            remote_components=remote_components,
         )
+    except DownloadError as exc:
+        if is_youtube_url:
+            raise DownloadError(_youtube_error_message(exc)) from exc
+        raise
 
-        # Write sidecar
-        sidecar_payload = {
-            "site": metadata.site,
-            "content_id": metadata.content_id,
-            "author": metadata.author,
-            "desc": metadata.desc,
-            "title": metadata.title,
-            "source_url": metadata.source_url,
-            "canonical_url": metadata.canonical_url,
-            "page_url": metadata.page_url,
-            "output_path": str(output_path),
-            "chosen_candidate": candidate.to_dict(),
-            "watermark_mode": candidate.watermark_mode.value,
-            "candidates": [candidate.to_dict()],
-            "diagnostics": extraction.diagnostics,
-            "attempts": [{"url": parsed.canonical_url, "mode": "ytdlp", "status": "ok"}],
-        }
-        sidecar_path.write_text(
-            json.dumps(sidecar_payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+    # Write sidecar
+    sidecar_payload = {
+        "site": metadata.site,
+        "content_id": metadata.content_id,
+        "author": metadata.author,
+        "desc": metadata.desc,
+        "title": metadata.title,
+        "source_url": metadata.source_url,
+        "canonical_url": metadata.canonical_url,
+        "page_url": metadata.page_url,
+        "output_path": str(output_path),
+        "chosen_candidate": candidate.to_dict(),
+        "watermark_mode": candidate.watermark_mode.value,
+        "candidates": [candidate.to_dict()],
+        "diagnostics": extraction.diagnostics,
+        "attempts": [{"url": parsed.canonical_url, "mode": "ytdlp", "status": "ok"}],
+    }
+    sidecar_path.write_text(
+        json.dumps(sidecar_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
-        artifact = DownloadArtifact(
-            output_path=output_path,
-            sidecar_path=sidecar_path,
-            chosen_candidate=candidate,
-            attempts=[{"url": parsed.canonical_url, "mode": "ytdlp", "status": "ok"}],
-        )
-        return extraction, artifact
+    artifact = DownloadArtifact(
+        output_path=output_path,
+        sidecar_path=sidecar_path,
+        chosen_candidate=candidate,
+        attempts=[{"url": parsed.canonical_url, "mode": "ytdlp", "status": "ok"}],
+    )
+    return extraction, artifact
 
 
 def _run_download_jobs(
@@ -428,6 +607,10 @@ def _run_download_jobs(
     start_interval_secs: float,
     watermark: WatermarkConfig | None = None,
     max_video_duration_secs: int = 0,
+    ytdlp_extractor_args: str = "",
+    ytdlp_cookies_file: Path | None = None,
+    ytdlp_remote_components: bool = False,
+    force_redownload: bool = False,
 ) -> list[DownloadJobResult]:
     results: list[DownloadJobResult | None] = [None] * len(prepared_inputs)
     total_limit = max(1, max_concurrent)
@@ -435,6 +618,7 @@ def _run_download_jobs(
     gate = StartIntervalGate(start_interval_secs)
     site_semaphores: dict[str, threading.Semaphore] = {}
     site_lock = threading.Lock()
+    ytdlp_setup_failed = threading.Event()
 
     def site_semaphore(provider_key: str) -> threading.Semaphore:
         with site_lock:
@@ -465,6 +649,15 @@ def _run_download_jobs(
     def worker(index: int, parsed: ParsedInput, semaphore: threading.Semaphore) -> None:
         extraction: ExtractionResult | None = None
         try:
+            if parsed.provider_key == "ytdlp" and ytdlp_setup_failed.is_set():
+                results[index] = DownloadJobResult(
+                    raw_input=parsed.raw_input,
+                    parsed_input=parsed,
+                    extraction=None,
+                    artifact=None,
+                    error="已跳过：前面的 YouTube 下载验证或格式检查失败，请先粘贴有效 Cookie 后重试。",
+                )
+                return
             gate.wait()
             log_info(
                 "job.extract.start",
@@ -478,6 +671,10 @@ def _run_download_jobs(
                     "browser_config": browser_config,
                     "output_dir": output_dir,
                     "timeout_secs": timeout_secs,
+                    "extractor_args": ytdlp_extractor_args,
+                    "cookies_file": ytdlp_cookies_file,
+                    "remote_components": ytdlp_remote_components,
+                    "force_redownload": force_redownload,
                 }
                 if max_video_duration_secs > 0:
                     kwargs["max_video_duration_secs"] = max_video_duration_secs
@@ -534,6 +731,31 @@ def _run_download_jobs(
                     content_id=extraction.metadata.content_id or "unknown",
                     candidates=len(extraction.candidates),
                 )
+                existing = None if force_redownload else _find_existing_download(output_dir, extraction.metadata.content_id)
+                if existing:
+                    candidate = extraction.candidates[0] if extraction.candidates else MediaCandidate(
+                        url=parsed.canonical_url,
+                        kind=MediaKind.MP4,
+                        track_type=TrackType.UNKNOWN,
+                        watermark_mode=WatermarkMode.UNKNOWN,
+                        source="reuse",
+                        observed_via="sidecar",
+                    )
+                    artifact = _artifact_from_existing(existing, candidate)
+                    results[index] = DownloadJobResult(
+                        raw_input=parsed.raw_input,
+                        parsed_input=parsed,
+                        extraction=extraction,
+                        artifact=artifact,
+                    )
+                    log_info(
+                        "job.download.reuse",
+                        job=index + 1,
+                        site=parsed.provider_key or extraction.metadata.site,
+                        content_id=extraction.metadata.content_id or "unknown",
+                        output=artifact.output_path,
+                    )
+                    return
                 kwargs = {
                     "extraction": extraction,
                     "output_dir": output_dir,
@@ -542,7 +764,15 @@ def _run_download_jobs(
                 }
                 if max_video_duration_secs > 0:
                     kwargs["max_video_duration_secs"] = max_video_duration_secs
-                artifact = _download_extraction_artifact(**kwargs)
+                try:
+                    artifact = _download_extraction_artifact(**kwargs)
+                except DownloadError as exc:
+                    if parsed.provider_key == "youtube":
+                        raise DownloadError(
+                            "YouTube 返回了受保护的视频流，当前未配置可用 Cookie/PO Token，已跳过下载；"
+                            "请在 App 的下载页粘贴 YouTube cookies.txt 内容后重试。"
+                        ) from exc
+                    raise
                 results[index] = DownloadJobResult(
                     raw_input=parsed.raw_input,
                     parsed_input=parsed,
@@ -557,6 +787,8 @@ def _run_download_jobs(
                     output=artifact.output_path,
                 )
         except Exception as exc:
+            if parsed.provider_key == "ytdlp" and _is_ytdlp_setup_error(str(exc)):
+                ytdlp_setup_failed.set()
             results[index] = DownloadJobResult(
                 raw_input=parsed.raw_input,
                 parsed_input=parsed,
@@ -630,8 +862,16 @@ def download_videos(options: DownloadOptions) -> list[tuple[ExtractionResult, Do
     ]
     prepared_inputs = dedupe_prepared_inputs(prepared_inputs)
     prepared_inputs = _expand_profile_inputs(
-        prepared_inputs, browser_config, options.profile_videos_count, options.timeout_secs,
+        prepared_inputs,
+        browser_config,
+        options.profile_videos_count,
+        options.timeout_secs,
+        options.profile_order,
+        options.ytdlp_cookies_file,
+        options.ytdlp_extractor_args,
+        options.ytdlp_remote_components,
     )
+    prepared_inputs = _exclude_processed_inputs(prepared_inputs, options.skip_content_ids)
     job_results = _run_download_jobs(
         prepared_inputs=prepared_inputs,
         browser_config=browser_config,
@@ -641,6 +881,10 @@ def download_videos(options: DownloadOptions) -> list[tuple[ExtractionResult, Do
         max_concurrent_per_site=options.max_concurrent_per_site,
         start_interval_secs=options.start_interval_secs,
         watermark=options.watermark,
+        ytdlp_extractor_args=options.ytdlp_extractor_args,
+        ytdlp_cookies_file=options.ytdlp_cookies_file,
+        ytdlp_remote_components=options.ytdlp_remote_components,
+        force_redownload=options.force_redownload,
     )
     failures = [item for item in job_results if not item.ok]
     if failures:
@@ -671,8 +915,16 @@ def download_jobs(options: DownloadOptions) -> list[DownloadJobResult]:
     ]
     prepared_inputs = dedupe_prepared_inputs(prepared_inputs)
     prepared_inputs = _expand_profile_inputs(
-        prepared_inputs, browser_config, options.profile_videos_count, options.timeout_secs,
+        prepared_inputs,
+        browser_config,
+        options.profile_videos_count,
+        options.timeout_secs,
+        options.profile_order,
+        options.ytdlp_cookies_file,
+        options.ytdlp_extractor_args,
+        options.ytdlp_remote_components,
     )
+    prepared_inputs = _exclude_processed_inputs(prepared_inputs, options.skip_content_ids)
     return _run_download_jobs(
         prepared_inputs=prepared_inputs,
         browser_config=browser_config,
@@ -682,6 +934,10 @@ def download_jobs(options: DownloadOptions) -> list[DownloadJobResult]:
         max_concurrent_per_site=options.max_concurrent_per_site,
         start_interval_secs=options.start_interval_secs,
         watermark=options.watermark,
+        ytdlp_extractor_args=options.ytdlp_extractor_args,
+        ytdlp_cookies_file=options.ytdlp_cookies_file,
+        ytdlp_remote_components=options.ytdlp_remote_components,
+        force_redownload=options.force_redownload,
     )
 
 

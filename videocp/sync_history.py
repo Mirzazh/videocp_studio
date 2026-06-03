@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -61,8 +62,21 @@ def find_processed_entry(history: SyncHistory, task_name: str, content_id: str) 
 def add_entry(history: SyncHistory, entry: SyncHistoryEntry) -> None:
     if not entry.synced_at:
         entry.synced_at = datetime.now(timezone(timedelta(hours=8))).isoformat()
-    history.entries.append(entry)
-    _save(history)
+    history.path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = history.path.with_suffix(history.path.suffix + ".lock")
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        latest = load_history(history.path)
+        if entry.status == "failed" or not any(
+            existing.task_name == entry.task_name
+            and existing.content_id == entry.content_id
+            and existing.status == entry.status
+            for existing in latest.entries
+        ):
+            latest.entries.append(entry)
+            _save(latest)
+        history.entries = latest.entries
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _save(history: SyncHistory) -> None:
@@ -74,3 +88,4 @@ def _save(history: SyncHistory) -> None:
     tmp_path = history.path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp_path, history.path)
+    history.path.chmod(0o600)

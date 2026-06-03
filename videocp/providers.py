@@ -4,7 +4,7 @@ import json
 import re
 from abc import ABC
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 from videocp.errors import ExtractionError
 from videocp.models import MediaCandidate, MediaKind, TrackType, VideoMetadata, WatermarkMode
@@ -23,6 +23,8 @@ BILIBILI_VIDEO_ID_RE = re.compile(r"/video/([A-Za-z0-9]+)")
 BILIBILI_SPACE_RE = re.compile(r"^space\.bilibili\.com$", re.IGNORECASE)
 XHS_NOTE_ID_RE = re.compile(r"/(?:explore|discovery/item)/([A-Za-z0-9]+)")
 XHS_USER_PROFILE_RE = re.compile(r"/user/profile/([A-Za-z0-9]+)")
+YOUTUBE_VIDEO_ID_RE = re.compile(r"(?:/shorts/|[?&]v=|youtu\.be/)([A-Za-z0-9_-]{6,})")
+YOUTUBE_CHANNEL_RE = re.compile(r"^/@[^/]+/(?:shorts|videos|streams)/?$")
 
 
 def normalize_url_path(url: str) -> str:
@@ -372,6 +374,17 @@ class DouyinProvider(SiteProvider):
         metadata = super().create_metadata(source_url)
         metadata.aweme_id = extract_id_from_url(source_url, self.id_patterns)
         return metadata
+
+    def apply_dom_snapshot(self, metadata: VideoMetadata, snapshot: dict[str, str], add_candidate) -> None:
+        super().apply_dom_snapshot(metadata, snapshot, add_candidate)
+        raw_title = snapshot.get("og_title") or snapshot.get("title") or metadata.title
+        cleaned_title = re.sub(r"^\(\d+\)\s*", "", clean_title_suffix(raw_title, self.title_suffixes)).strip()
+        if cleaned_title:
+            metadata.title = cleaned_title
+            metadata.desc = cleaned_title
+        duration_ms = _seconds_to_ms(snapshot.get("video_duration", ""))
+        if duration_ms > 0:
+            metadata.duration_ms = duration_ms
 
     def candidate_rank(self, candidate: MediaCandidate) -> tuple[int, int, int, int, int, int, int, str]:
         watermark_rank = 0 if candidate.watermark_mode == WatermarkMode.NO_WATERMARK else 1
@@ -740,10 +753,102 @@ class XiaohongshuProvider(SiteProvider):
                     self._add_possible_media_value(accumulator, value.get(nested_key), f"{path}.{nested_key}")
 
 
+class YouTubeProvider(SiteProvider):
+    key = "youtube"
+    display_name = "YouTube"
+    hosts = ("youtube.com", "youtu.be")
+    media_hints = ("googlevideo.com/videoplayback", ".m3u8", "mime=video")
+    json_hints = ("youtubei/v1/player", "youtubei/v1/next")
+    markup_json_markers = ("ytInitialPlayerResponse =", "ytInitialPlayerResponse=", "ytInitialData =", "ytInitialData=")
+    id_patterns = (YOUTUBE_VIDEO_ID_RE,)
+    title_suffixes = (" - YouTube",)
+    default_watermark_mode = WatermarkMode.NO_WATERMARK
+
+    def is_profile_url(self, url: str) -> bool:
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/") + "/"
+        return bool(YOUTUBE_CHANNEL_RE.match(path))
+
+    def create_metadata(self, source_url: str) -> VideoMetadata:
+        metadata = super().create_metadata(source_url)
+        metadata.aweme_id = extract_id_from_url(source_url, self.id_patterns)
+        return metadata
+
+    def is_media_request_candidate(self, url: str) -> bool:
+        lowered = unquote(url.lower())
+        if "googlevideo.com/videoplayback" not in lowered:
+            return ".m3u8" in lowered
+        return "sabr=1" not in lowered
+
+    def infer_media_kind(self, url: str, content_type: str = "", semantic_tag: str = "") -> MediaKind | None:
+        del semantic_tag
+        lowered = unquote(url.lower())
+        lowered_type = content_type.lower()
+        if "sabr=1" in lowered:
+            return None
+        if "googlevideo.com/videoplayback" in lowered:
+            return MediaKind.MP4
+        if "mpegurl" in lowered_type or ".m3u8" in lowered:
+            return MediaKind.HLS
+        return super().infer_media_kind(url, content_type)
+
+    def infer_track_type(self, url: str, kind: MediaKind, content_type: str = "", semantic_tag: str = "") -> TrackType:
+        del semantic_tag
+        lowered = unquote(url.lower())
+        lowered_type = content_type.lower()
+        if "itag=18" in lowered:
+            return TrackType.MUXED
+        if "mime=audio/" in lowered or lowered_type.startswith("audio/"):
+            return TrackType.AUDIO_ONLY
+        if "mime=video/" in lowered or lowered_type.startswith("video/"):
+            return TrackType.VIDEO_ONLY
+        if "googlevideo.com/videoplayback" in lowered:
+            return TrackType.MUXED
+        return super().infer_track_type(url, kind, content_type=content_type)
+
+    def candidate_rank(self, candidate: MediaCandidate) -> tuple[int, int, int, int, str]:
+        lowered = unquote(candidate.url.lower())
+        track_rank = {
+            TrackType.MUXED: 0,
+            TrackType.VIDEO_ONLY: 1,
+            TrackType.UNKNOWN: 2,
+            TrackType.AUDIO_ONLY: 3,
+        }[candidate.track_type]
+        source_rank = 0 if candidate.source == "json" else 1
+        kind_rank = 0 if candidate.kind == MediaKind.MP4 else 1
+        sabr_rank = 1 if "sabr=1" in lowered else 0
+        return (sabr_rank, track_rank, kind_rank, source_rank, candidate.url)
+
+    def populate_metadata_from_dict(self, metadata: VideoMetadata, payload: dict, path: str) -> None:
+        del path
+        details = payload.get("videoDetails")
+        if not isinstance(details, dict):
+            return
+        video_id = details.get("videoId")
+        if isinstance(video_id, str) and not metadata.aweme_id:
+            metadata.aweme_id = video_id
+        title = details.get("title")
+        if isinstance(title, str) and not metadata.title:
+            metadata.title = title
+            metadata.desc = title
+        author = details.get("author")
+        if isinstance(author, str) and not metadata.author:
+            metadata.author = author
+        if metadata.duration_ms <= 0:
+            metadata.duration_ms = _seconds_to_ms(details.get("lengthSeconds"))
+
+    def scan_media_node(self, accumulator, key: str, value: object, path: str) -> None:
+        if key == "url" and isinstance(value, str) and "googlevideo.com/videoplayback" in value:
+            accumulator.add_candidate(value, source="json", observed_via="json", semantic_tag=path, note=path)
+        if key == "hlsManifestUrl" and isinstance(value, str):
+            accumulator.add_candidate(value, source="json", observed_via="json", semantic_tag=path, note=path)
+
+
 PROVIDERS: tuple[SiteProvider, ...] = (
     DouyinProvider(),
     BilibiliProvider(),
     XiaohongshuProvider(),
+    YouTubeProvider(),
 )
 
 

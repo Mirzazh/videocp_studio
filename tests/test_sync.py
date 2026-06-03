@@ -5,11 +5,11 @@ from videocp.app import DownloadJobResult
 from videocp.config import AppConfig, SyncConfig, SyncTaskConfig, WatermarkConfig
 from videocp.models import ParsedInput
 from videocp.publisher import PublishResult
-from videocp.sync import _sync_one_video
+from videocp.sync import SyncTaskResult, _sync_one_task, _sync_one_video
 from videocp.sync_history import SyncHistory
 
 
-def test_sync_skill_publish_uses_author_identity_even_with_channel_config(tmp_path: Path, monkeypatch):
+def test_sync_skill_publish_passes_channel_scope_when_configured(tmp_path: Path, monkeypatch):
     video_path = tmp_path / "downloads" / "video.mp4"
     video_path.parent.mkdir(parents=True)
     video_path.write_bytes(b"video")
@@ -81,7 +81,7 @@ def test_sync_skill_publish_uses_author_identity_even_with_channel_config(tmp_pa
 
     assert result.ok is True
     assert result.action == "synced"
-    assert captured == {"guild_id": "", "channel_id": "", "feed_type": 1}
+    assert captured == {"guild_id": "123", "channel_id": "456", "feed_type": 1}
 
 
 def _make_sync_args(tmp_path, monkeypatch, *, task_skip_rate=-1, global_skip_rate=1.0, is_pinned=False):
@@ -217,3 +217,58 @@ def test_sync_skips_videos_over_duration_limit(tmp_path, monkeypatch):
 
     assert result.ok is True
     assert result.action == "skipped_duration"
+
+
+def test_sync_one_task_tries_buffered_profile_items_until_requested_success(tmp_path, monkeypatch):
+    parsed_profile = ParsedInput(
+        raw_input="https://example.com/profile",
+        extracted_url="https://example.com/profile",
+        canonical_url="https://example.com/profile",
+        is_profile=True,
+    )
+    expanded = [
+        ParsedInput(raw_input=f"https://example.com/v/{i}", extracted_url=f"https://example.com/v/{i}", canonical_url=f"https://example.com/v/{i}")
+        for i in range(4)
+    ]
+    captured: dict = {}
+
+    monkeypatch.setattr("videocp.sync.parse_input", lambda *a, **k: parsed_profile)
+
+    def fake_expand_profile_inputs(inputs, browser_config, profile_videos_count, timeout_secs):
+        captured["profile_videos_count"] = profile_videos_count
+        return expanded
+
+    results = [
+        SyncTaskResult(task_name="t", ok=True, content_id="0", action="skipped_unavailable"),
+        SyncTaskResult(task_name="t", ok=True, content_id="1", action="synced"),
+        SyncTaskResult(task_name="t", ok=True, content_id="2", action="synced"),
+    ]
+
+    def fake_sync_one_video(**kwargs):
+        return results.pop(0)
+
+    monkeypatch.setattr("videocp.sync._expand_profile_inputs", fake_expand_profile_inputs)
+    monkeypatch.setattr("videocp.sync._sync_one_video", fake_sync_one_video)
+
+    task_results = _sync_one_task(
+        task=SyncTaskConfig(name="t", source_url="https://example.com/profile", guild_id="", channel_id=""),
+        app_cfg=AppConfig(
+            output_dir=tmp_path / "downloads",
+            profile_dir=tmp_path / "p",
+            browser_path="/usr/bin/chrome",
+            headless=False,
+            timeout_secs=30,
+            max_concurrent=1,
+            max_concurrent_per_site=1,
+            start_interval_secs=0.0,
+            watermark=WatermarkConfig(),
+        ),
+        sync_cfg=SyncConfig(history_file=tmp_path / "h.json", skill_dir=tmp_path / "s", tasks=[]),
+        browser_config=BrowserConfig(profile_dir=tmp_path / "p", browser_path="/usr/bin/chrome"),
+        history=SyncHistory(path=tmp_path / "h.json"),
+        dry_run=False,
+        count=1,
+    )
+
+    assert captured["profile_videos_count"] == 4
+    assert [r.action for r in task_results] == ["skipped_unavailable", "synced"]

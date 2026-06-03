@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--json", action="store_true", help="Print result as JSON.")
     download_parser.add_argument("--timeout-secs", type=int, default=None, help="Timeout in seconds.")
     download_parser.add_argument("--profile-videos-count", type=int, default=None, help="Number of recent videos to download from a profile page.")
+    download_parser.add_argument("--profile-order", choices=["latest", "popular"], default="latest", help="Profile page ordering.")
+    download_parser.add_argument("--ytdlp-extractor-args", default="", help="Extra yt-dlp --extractor-args value.")
 
     prepare_parser = subparsers.add_parser("prepare-list", help="Resolve inputs and write a canonical URL list.")
     prepare_parser.add_argument("inputs", nargs="*", help="URL, short link, or share text.")
@@ -85,6 +88,33 @@ def build_parser() -> argparse.ArgumentParser:
     sync_headless.add_argument("--headless", dest="headless", action="store_true", help="Run Chrome headless.")
     sync_headless.add_argument("--no-headless", dest="headless", action="store_false", help="Run Chrome with a visible window.")
     sync_parser.set_defaults(headless=None)
+
+    app_parser = subparsers.add_parser("mac-app", help="Open the macOS scheduler app.")
+    app_parser.add_argument("--app-config", default=None, help="Path to mac-app.json.")
+
+    schedule_parser = subparsers.add_parser("schedule", help="Run the macOS scheduler loop.")
+    schedule_parser.add_argument("--app-config", default=None, help="Path to mac-app.json.")
+    schedule_parser.add_argument("--once", action="store_true", help="Run one scheduled sync cycle and exit.")
+    schedule_parser.add_argument("--dry-run", action="store_true", help="Plan without downloading or publishing.")
+    schedule_parser.add_argument("--task-name", default=None, help="Run only the named source task.")
+
+    app_download_parser = subparsers.add_parser("app-download", help="Run macOS app download workflow.")
+    app_download_parser.add_argument("--app-config", default=None, help="Path to mac-app.json.")
+    app_download_parser.add_argument("--force-redownload", action="store_true", help="Download again even if history or local files already exist.")
+
+    app_parse_profile_parser = subparsers.add_parser("app-parse-profile", help="Parse a homepage URL for the macOS app.")
+    app_parse_profile_parser.add_argument("--app-config", default=None, help="Path to mac-app.json.")
+    app_parse_profile_parser.add_argument("--url", required=True, help="Homepage URL to parse.")
+
+    app_publish_parser = subparsers.add_parser("app-publish", help="Run macOS app directory publish workflow.")
+    app_publish_parser.add_argument("--app-config", default=None, help="Path to mac-app.json.")
+
+    youtube_setup_parser = subparsers.add_parser("app-youtube-setup", help="Install/check YouTube PO Token helper for the macOS app.")
+    youtube_setup_parser.add_argument("--json", action="store_true", help="Print result as JSON.")
+
+    tencent_setup_parser = subparsers.add_parser("app-tencent-setup", help="Install/check Tencent channel skill for the macOS app.")
+    tencent_setup_parser.add_argument("--check", action="store_true", help="Only check current Tencent channel status.")
+    tencent_setup_parser.add_argument("--json", action="store_true", help="Print result as JSON.")
 
     return parser
 
@@ -136,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
                     start_interval_secs=config.start_interval_secs,
                     watermark=config.watermark,
                     profile_videos_count=config.profile_videos_count,
+                    profile_order=args.profile_order,
+                    ytdlp_extractor_args=args.ytdlp_extractor_args,
                 )
             )
             payload = [
@@ -245,6 +277,85 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         print(f"[failed] {r.task_name}: {r.error}")
             return 0 if all(r.ok for r in results) else 1
+
+        if args.command == "mac-app":
+            from videocp.mac_web_app import main as app_main
+
+            app_args = []
+            if args.app_config:
+                # The GUI currently uses the default config path; keeping this
+                # argument in the public CLI leaves room for alternate launchers.
+                app_args.extend(["--app-config", args.app_config])
+            return app_main(app_args)
+
+        if args.command == "schedule":
+            from videocp.mac_scheduler import main as scheduler_main
+
+            scheduler_args = []
+            if args.app_config:
+                scheduler_args.extend(["--app-config", args.app_config])
+            if args.once:
+                scheduler_args.append("--once")
+            if args.dry_run:
+                scheduler_args.append("--dry-run")
+            if args.task_name:
+                scheduler_args.extend(["--task-name", args.task_name])
+            return scheduler_main(scheduler_args)
+
+        if args.command == "app-download":
+            from videocp.mac_scheduler import default_app_config_path
+            from videocp.mac_workflow import run_download_from_app_config
+
+            path = Path(args.app_config).expanduser().resolve() if args.app_config else default_app_config_path(Path.cwd())
+            results = run_download_from_app_config(path, force_redownload=args.force_redownload)
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+            return 0 if all(item.get("ok") for item in results) else 1
+
+        if args.command == "app-parse-profile":
+            from videocp.mac_scheduler import default_app_config_path
+            from videocp.mac_workflow import parse_profile_from_app_config
+
+            path = Path(args.app_config).expanduser().resolve() if args.app_config else default_app_config_path(Path.cwd())
+            result = parse_profile_from_app_config(path, args.url)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result.get("ok") else 1
+
+        if args.command == "app-publish":
+            from videocp.mac_scheduler import default_app_config_path
+            from videocp.mac_workflow import run_publish_from_app_config
+
+            path = Path(args.app_config).expanduser().resolve() if args.app_config else default_app_config_path(Path.cwd())
+            results = run_publish_from_app_config(path)
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+            return 0 if all(item.get("ok") for item in results) else 1
+
+        if args.command == "app-youtube-setup":
+            from videocp.youtube_po import ensure_provider_installed
+
+            result = ensure_provider_installed(install=True)
+            payload = result.to_dict()
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            elif result.ok:
+                print(f"YouTube 下载组件已就绪: {result.package} {result.version}")
+                print(f"yt-dlp 参数: {result.extractor_args}")
+            else:
+                print(f"YouTube 下载组件准备失败: {result.error}")
+            return 0 if result.ok else 1
+
+        if args.command == "app-tencent-setup":
+            from videocp.tencent_skill import check_tencent_channel_skill, setup_tencent_channel_skill
+
+            token = "" if args.check else (os.environ.get("QQ_AI_CONNECT_TOKEN_INPUT") or os.environ.get("QQ_AI_CONNECT_TOKEN") or "")
+            result = check_tencent_channel_skill() if args.check else setup_tencent_channel_skill(token=token, install=True)
+            payload = result.to_dict()
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            elif result.ok:
+                print(f"腾讯频道已就绪，登录来源: {result.token_source or 'unknown'}")
+            else:
+                print(f"腾讯频道未就绪: {result.error}")
+            return 0 if result.ok else 1
 
         checks = doctor(
             DoctorOptions(

@@ -287,6 +287,7 @@ tasks:
 | `tasks[].name` | 任务唯一名称，用于过滤和历史记录 |
 | `tasks[].source_url` | 来源主页 URL 或单视频 URL |
 | `tasks[].guild_id` | `publish_method: cdp` 必填 |
+| `tasks[].channel_id` | `publish_method: skill` 频道内发帖时填写；留空则按作者身份全局发帖 |
 | `tasks[].title_template` | 支持 `{desc}`、`{title}`、`{author}`、`{site}`、`{content_id}` |
 | `tasks[].content_template` | 支持同样的占位符 |
 | `tasks[].feed_type` | skill 发布使用的帖子类型 |
@@ -298,7 +299,7 @@ tasks:
 
 | 方式 | 适用场景 | 注意事项 |
 | --- | --- | --- |
-| `skill` | 通过本地 `tencent-channel-community` skill 发布 | 按作者身份发布；配置的 `guild_id` / `channel_id` 会被忽略 |
+| `skill` | 通过本地 `tencent-channel-community` skill 发布 | 留空 `guild_id` / `channel_id` 为作者全局发帖；填写两者为频道内发帖 |
 | `cdp` | 通过真实 QQ 频道网页发布 | 需要 `guild_id`，且浏览器已登录 |
 | `youtube` | 发布到 YouTube | 需要浏览器已登录对应账号 |
 
@@ -307,6 +308,35 @@ tasks:
 - 状态为 `ok`、`skipped_unavailable`、`skipped_random` 或 `skipped_duration` 的记录会被视为已处理，后续会跳过。
 - 如果来源视频不可下载，例如 YouTube 会员专属内容，sync 会标记为 `skipped_unavailable`，而不是让整次任务失败。
 - `cdp` 发布成功后，浏览器页面会短暂停留再关闭。
+
+### macOS 定时发帖 App
+
+本项目内置一个轻量 macOS 配置界面，用来管理“主页来源 → 下载 → 腾讯频道发帖”的定时任务：
+
+```bash
+uv run videocp mac-app
+```
+
+界面会维护 `mac-app.json`，并自动生成 `mac-tasks.yaml` 给 `videocp sync` 使用。支持：
+
+- 配置一批 YouTube 主页、Shorts 页、B 站空间、抖音主页等来源。
+- 设置每天开始/结束时间，以及循环间隔分钟数。
+- 每个来源设置抓取最新几条。
+- 腾讯频道 Skill 发帖支持两种范围：
+  - `author_global`：作者身份全局发帖，不填频道 ID/版块 ID。
+  - `channel`：频道内发帖，需要填写 `guild_id` 和 `channel_id`。
+- 使用独立历史文件去重：`download_history_mac.json` 防止已下载内容在文件清理后重复下载，`publish_history_mac.json` 防止已发布内容重复发帖。
+- 定期清理 `downloads` 目录，支持按保留天数和总占用 GB 上限删除旧视频及 sidecar JSON。
+
+也可以不打开界面，直接跑调度器：
+
+```bash
+# 运行一次
+uv run videocp schedule --once
+
+# 常驻运行，在 mac-app.json 的时间窗口内按间隔执行
+uv run videocp schedule
+```
 
 ## 配置
 

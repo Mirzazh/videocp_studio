@@ -16,6 +16,13 @@ def test_parse_input_sets_provider_key(monkeypatch):
     assert parsed.provider_key == "bilibili"
 
 
+def test_parse_input_routes_bilibili_space_profile_through_playlist_expansion(monkeypatch):
+    monkeypatch.setattr("videocp.input_parser.resolve_url", lambda url, timeout_secs=15: url)
+    parsed = parse_input("https://space.bilibili.com/7612168/video")
+    assert parsed.provider_key == "ytdlp"
+    assert parsed.is_profile is True
+
+
 def test_douyin_provider_canonicalizes_modal_and_light_urls():
     provider = get_provider_by_key("douyin")
     assert provider.canonicalize_url("https://www.douyin.com/jingxuan?modal_id=7617405320117128502") == (

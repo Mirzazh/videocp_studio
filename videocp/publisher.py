@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,15 +26,96 @@ def _as_publish_scope_id(value: str) -> int:
     return int(raw)
 
 
-def publish_to_channel(
+def _find_tencent_channel_cli() -> str:
+    bundled_bin = os.environ.get("VIDEOCP_BUNDLED_BIN", "")
+    candidates = [
+        str(Path(bundled_bin) / "tencent-channel-cli") if bundled_bin else "",
+        shutil.which("tencent-channel-cli"),
+        str(Path.home() / ".local" / "bin" / "tencent-channel-cli"),
+        "/opt/homebrew/bin/tencent-channel-cli",
+        "/usr/local/bin/tencent-channel-cli",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def _find_ffmpeg() -> str:
+    bundled_bin = os.environ.get("VIDEOCP_BUNDLED_BIN", "")
+    candidates = [
+        str(Path(bundled_bin) / "ffmpeg") if bundled_bin else "",
+        shutil.which("ffmpeg"),
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def _publish_env() -> dict[str, str]:
+    env = {**os.environ}
+    bundled_bin = env.get("VIDEOCP_BUNDLED_BIN", "")
+    env["PATH"] = f"{bundled_bin}:/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "")
+    return env
+
+
+def is_login_state_publish_error(error: str) -> bool:
+    value = str(error or "").lower()
+    markers = [
+        "登录态",
+        "login",
+        "token",
+        "151",
+        "oidb",
+        "apply_media_upload",
+        "上传失败",
+    ]
+    return any(marker.lower() in value for marker in markers)
+
+
+def check_tencent_login_status(timeout_secs: int = 30) -> PublishResult:
+    cli = _find_tencent_channel_cli()
+    if not cli:
+        return PublishResult(success=False, error="tencent-channel-cli not found")
+    try:
+        proc = subprocess_run(
+            [cli, "login", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_secs,
+            env=_publish_env(),
+        )
+    except Exception as exc:
+        return PublishResult(success=False, error=f"Failed to check Tencent login status: {exc}")
+    if proc.returncode != 0:
+        return PublishResult(success=False, error=(proc.stderr or proc.stdout or "").strip())
+    try:
+        payload = json.loads((proc.stdout or "").strip())
+    except json.JSONDecodeError:
+        return PublishResult(success=False, error="Tencent login status returned invalid JSON")
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    logged_in = bool(
+        isinstance(data, dict)
+        and payload.get("success")
+        and (data.get("valid") is True or data.get("isLoggedIn") is True)
+    )
+    if not logged_in:
+        return PublishResult(success=False, error="腾讯频道登录态未通过检查")
+    return PublishResult(success=True)
+
+
+def _legacy_publish_to_channel(
     skill_dir: Path,
     video_path: Path,
     guild_id: str,
     channel_id: str,
     title: str,
     content: str,
-    feed_type: int = 1,
-    timeout_secs: int = 300,
+    feed_type: int,
+    timeout_secs: int,
 ) -> PublishResult:
     script = skill_dir / "scripts" / "feed" / "write" / "publish_feed.py"
     if not script.is_file():
@@ -56,7 +138,7 @@ def publish_to_channel(
         payload["title"] = title
 
     cwd = str(skill_dir)
-    env = {**os.environ}
+    env = _publish_env()
 
     python = sys.executable
 
@@ -73,28 +155,130 @@ def publish_to_channel(
     except Exception as exc:
         raise PublishError(f"Failed to run publish_feed.py: {exc}") from exc
 
-    stdout = proc.stdout.strip()
+    return _parse_publish_process_result(proc)
+
+
+def _cli_publish_to_channel(
+    video_path: Path,
+    guild_id: str,
+    channel_id: str,
+    title: str,
+    content: str,
+    feed_type: int,
+    timeout_secs: int,
+) -> PublishResult:
+    cli = _find_tencent_channel_cli()
+    if not cli:
+        raise PublishError("tencent-channel-cli not found. Install it before using publish_method: skill.")
+    if not _find_ffmpeg():
+        raise PublishError("ffmpeg not found. Install it with: brew install ffmpeg")
+
+    if feed_type == 1:
+        if not content and title:
+            content = title
+        title = ""
+
+    command = [
+        cli,
+        "feed",
+        "publish-feed",
+        "--json",
+        "--feed-type",
+        str(feed_type),
+        "--content",
+        content,
+        "--video",
+        str(video_path.resolve()),
+    ]
+    if guild_id and channel_id:
+        command.extend(["--guild-id", str(guild_id), "--channel-id", str(channel_id)])
+    if title:
+        command.extend(["--title", title])
+    # Author global posting is a write action without guild/channel scope. The
+    # official skill requires explicit confirmation; for unattended scheduled
+    # jobs this confirmation is represented by the user's config choice.
+    if not guild_id and not channel_id:
+        command.append("--yes")
+
+    try:
+        proc = subprocess_run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_secs,
+            env=_publish_env(),
+        )
+    except Exception as exc:
+        raise PublishError(f"Failed to run tencent-channel-cli: {exc}") from exc
+
+    return _parse_publish_process_result(proc)
+
+
+def _parse_publish_process_result(proc) -> PublishResult:
+    stdout = (proc.stdout or "").strip()
     if not stdout:
-        stderr_hint = proc.stderr.strip()[:500] if proc.stderr else ""
-        raise PublishError(f"publish_feed.py returned no output (exit {proc.returncode}). stderr: {stderr_hint}")
+        stderr_hint = (proc.stderr or "").strip()[:500]
+        raise PublishError(f"publish command returned no output (exit {proc.returncode}). stderr: {stderr_hint}")
 
     try:
         result = json.loads(stdout)
     except json.JSONDecodeError:
-        raise PublishError(f"publish_feed.py returned invalid JSON: {stdout[:200]}")
+        raise PublishError(f"publish command returned invalid JSON: {stdout[:200]}")
 
     if not result.get("success"):
-        error_msg = result.get("error", "unknown error")
+        error = result.get("error", {})
+        if isinstance(error, dict):
+            error_msg = error.get("message") or error.get("error") or json.dumps(error, ensure_ascii=False)
+        else:
+            error_msg = str(error or result.get("message") or "unknown error")
         needs_confirm = result.get("needs_confirm", False)
         if needs_confirm:
             raise PublishError(f"Upload requires confirmation: {error_msg}")
         return PublishResult(success=False, error=error_msg)
 
     data = result.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
     feed_id = data.get("feed_id", "") or data.get("帖子ID", "")
-    share_url = data.get("分享链接", "")
-    # Clean up share_url (wrapped in angle brackets)
-    if share_url.startswith("<") and share_url.endswith(">"):
+    share_url = (
+        data.get("share_url", "")
+        or data.get("分享链接", "")
+        or data.get("url", "")
+    )
+    if isinstance(share_url, str) and share_url.startswith("<") and share_url.endswith(">"):
         share_url = share_url[1:-1]
 
-    return PublishResult(success=True, feed_id=feed_id, share_url=share_url)
+    return PublishResult(success=True, feed_id=str(feed_id or ""), share_url=str(share_url or ""))
+
+
+def publish_to_channel(
+    skill_dir: Path,
+    video_path: Path,
+    guild_id: str,
+    channel_id: str,
+    title: str,
+    content: str,
+    feed_type: int = 1,
+    timeout_secs: int = 300,
+) -> PublishResult:
+    script = skill_dir / "scripts" / "feed" / "write" / "publish_feed.py"
+    if script.is_file():
+        return _legacy_publish_to_channel(
+            skill_dir=skill_dir,
+            video_path=video_path,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            title=title,
+            content=content,
+            feed_type=feed_type,
+            timeout_secs=timeout_secs,
+        )
+    return _cli_publish_to_channel(
+        video_path=video_path,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        title=title,
+        content=content,
+        feed_type=feed_type,
+        timeout_secs=timeout_secs,
+    )

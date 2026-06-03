@@ -2,7 +2,10 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from videocp.publisher import publish_to_channel
+import pytest
+
+from videocp.errors import PublishError
+from videocp.publisher import _find_ffmpeg, _find_tencent_channel_cli, publish_to_channel
 
 
 def test_publish_to_channel_uses_author_scope_when_ids_are_blank(tmp_path: Path, monkeypatch):
@@ -138,3 +141,129 @@ def test_publish_parses_feed_id_from_legacy_key(tmp_path: Path, monkeypatch):
     assert result.success is True
     assert result.feed_id == "legacy-id"
     assert result.share_url == "https://example.com"
+
+
+def test_publish_uses_tencent_channel_cli_when_official_skill_has_no_script(tmp_path: Path, monkeypatch):
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("videocp.publisher._find_tencent_channel_cli", lambda: "/bin/tencent-channel-cli")
+    monkeypatch.setattr("videocp.publisher._find_ffmpeg", lambda: "/opt/homebrew/bin/ffmpeg")
+
+    def fake_subprocess_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        return SimpleNamespace(
+            stdout=json.dumps({"success": True, "data": {"feed_id": "feed-cli", "share_url": "<https://pd.qq.com/s/x>"}}, ensure_ascii=False),
+            stderr="",
+            returncode=0,
+        )
+
+    monkeypatch.setattr("videocp.publisher.subprocess_run", fake_subprocess_run)
+
+    result = publish_to_channel(
+        skill_dir=tmp_path / "official-skill",
+        video_path=video_path,
+        guild_id="123",
+        channel_id="456",
+        title="",
+        content="hello",
+    )
+
+    assert result.success is True
+    assert result.feed_id == "feed-cli"
+    assert result.share_url == "https://pd.qq.com/s/x"
+    assert captured["command"] == [
+        "/bin/tencent-channel-cli",
+        "feed",
+        "publish-feed",
+        "--json",
+        "--feed-type",
+        "1",
+        "--content",
+        "hello",
+        "--video",
+        str(video_path.resolve()),
+        "--guild-id",
+        "123",
+        "--channel-id",
+        "456",
+    ]
+    assert captured["input"] is None
+
+
+def test_publish_author_global_cli_adds_yes(tmp_path: Path, monkeypatch):
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("videocp.publisher._find_tencent_channel_cli", lambda: "/bin/tencent-channel-cli")
+    monkeypatch.setattr("videocp.publisher._find_ffmpeg", lambda: "/opt/homebrew/bin/ffmpeg")
+
+    def fake_subprocess_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        return SimpleNamespace(
+            stdout=json.dumps({"success": True, "data": {"feed_id": "feed-global"}}, ensure_ascii=False),
+            stderr="",
+            returncode=0,
+        )
+
+    monkeypatch.setattr("videocp.publisher.subprocess_run", fake_subprocess_run)
+
+    result = publish_to_channel(
+        skill_dir=tmp_path / "official-skill",
+        video_path=video_path,
+        guild_id="",
+        channel_id="",
+        title="global title",
+        content="",
+    )
+
+    assert result.success is True
+    assert captured["command"] == [
+        "/bin/tencent-channel-cli",
+        "feed",
+        "publish-feed",
+        "--json",
+        "--feed-type",
+        "1",
+        "--content",
+        "global title",
+        "--video",
+        str(video_path.resolve()),
+        "--yes",
+    ]
+    assert captured["input"] is None
+
+
+def test_publish_cli_reports_missing_ffmpeg(tmp_path: Path, monkeypatch):
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+
+    monkeypatch.setattr("videocp.publisher._find_tencent_channel_cli", lambda: "/bin/tencent-channel-cli")
+    monkeypatch.setattr("videocp.publisher._find_ffmpeg", lambda: "")
+
+    with pytest.raises(PublishError, match="ffmpeg not found"):
+        publish_to_channel(
+            skill_dir=tmp_path / "official-skill",
+            video_path=video_path,
+            guild_id="",
+            channel_id="",
+            title="title",
+            content="",
+        )
+
+
+def test_publish_finds_bundled_cli_and_ffmpeg_before_system_paths(tmp_path: Path, monkeypatch):
+    bundled_bin = tmp_path / "bin"
+    bundled_bin.mkdir()
+    bundled_cli = bundled_bin / "tencent-channel-cli"
+    bundled_ffmpeg = bundled_bin / "ffmpeg"
+    bundled_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    bundled_ffmpeg.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("VIDEOCP_BUNDLED_BIN", str(bundled_bin))
+
+    assert _find_tencent_channel_cli() == str(bundled_cli)
+    assert _find_ffmpeg() == str(bundled_ffmpeg)

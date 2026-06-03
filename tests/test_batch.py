@@ -2,7 +2,7 @@ import time
 from pathlib import Path
 from threading import Lock
 
-from videocp.app import DownloadOptions, StartIntervalGate, dedupe_prepared_inputs, download_jobs, prepare_link_list, read_input_file
+from videocp.app import DownloadOptions, StartIntervalGate, _exclude_processed_inputs, dedupe_prepared_inputs, download_jobs, prepare_link_list, read_input_file
 from videocp.models import DownloadArtifact, ExtractionResult, MediaCandidate, MediaKind, ParsedInput, TrackType, VideoMetadata, WatermarkMode
 
 
@@ -78,6 +78,27 @@ def test_dedupe_prepared_inputs_keeps_first_canonical_url():
     unique = dedupe_prepared_inputs(prepared)
 
     assert [item.raw_input for item in unique] == ["https://a/1", "https://c/2"]
+
+
+def test_exclude_processed_inputs_skips_downloaded_content_ids():
+    prepared = [
+        ParsedInput(
+            raw_input="https://www.youtube.com/shorts/already-downloaded",
+            extracted_url="https://www.youtube.com/shorts/already-downloaded",
+            canonical_url="https://www.youtube.com/shorts/already-downloaded",
+            provider_key="ytdlp",
+        ),
+        ParsedInput(
+            raw_input="https://www.youtube.com/watch?v=new-video",
+            extracted_url="https://www.youtube.com/watch?v=new-video",
+            canonical_url="https://www.youtube.com/watch?v=new-video",
+            provider_key="ytdlp",
+        ),
+    ]
+
+    pending = _exclude_processed_inputs(prepared, {"already-downloaded"})
+
+    assert [item.raw_input for item in pending] == ["https://www.youtube.com/watch?v=new-video"]
 
 
 def test_start_interval_gate_enforces_spacing():

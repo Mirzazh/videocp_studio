@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -93,11 +94,19 @@ def build_requests_session(cookies: list[dict[str, Any]]) -> requests.Session:
 
 
 def find_ffmpeg() -> str:
-    return shutil.which("ffmpeg") or ""
+    return _find_bundled_or_system_executable("ffmpeg")
 
 
 def find_ffprobe() -> str:
-    return shutil.which("ffprobe") or ""
+    return _find_bundled_or_system_executable("ffprobe")
+
+
+def _find_bundled_or_system_executable(name: str) -> str:
+    bundled_bin = os.environ.get("VIDEOCP_BUNDLED_BIN", "")
+    bundled_path = Path(bundled_bin) / name if bundled_bin else None
+    if bundled_path is not None and bundled_path.is_file():
+        return str(bundled_path)
+    return shutil.which(name) or ""
 
 
 def probe_video_dimensions(video_path: Path) -> tuple[int, int]:
@@ -326,6 +335,15 @@ def download_mp4_to_path(
             if expected and size < expected:
                 raise DownloadError(f"Downloaded file is truncated: {size} < {expected}")
             temp_path.replace(target_path)
+            if (
+                "googlevideo.com" in candidate.url.lower()
+                and target_path.suffix.lower() == ".mp4"
+                and candidate.track_type != TrackType.AUDIO_ONLY
+            ):
+                width, height = probe_video_dimensions(target_path)
+                if find_ffprobe() and (width <= 0 or height <= 0):
+                    target_path.unlink(missing_ok=True)
+                    raise DownloadError("Downloaded file is not a playable video.")
             return size
         except requests.RequestException as exc:
             last_error = DownloadError(f"Request failed: {format_download_exception(exc)}")

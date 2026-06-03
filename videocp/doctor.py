@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -67,6 +68,8 @@ def run_doctor(
             checks.append(DoctorCheck("ytdlp", True, f"{ytdlp_path} (v{version})"))
         except Exception:
             checks.append(DoctorCheck("ytdlp", True, ytdlp_path))
+    elif importlib.util.find_spec("yt_dlp") is not None:
+        checks.append(DoctorCheck("ytdlp", True, "bundled Python module"))
     else:
         checks.append(DoctorCheck("ytdlp", False, "yt-dlp not found; generic site downloads will fail."))
 
