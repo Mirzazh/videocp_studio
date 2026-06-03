@@ -348,13 +348,26 @@ enum DownloadMode: String, CaseIterable, Identifiable {
     var icon: String { self == .single ? "link" : "person.2.crop.square.stack" }
 }
 
-enum ScheduleMode: String, CaseIterable, Identifiable {
-    case download
-    case publish
+enum PublishMode: String, CaseIterable, Identifiable {
+    case single
+    case scheduled
+    case history
 
     var id: String { rawValue }
-    var title: String { self == .download ? "定时下载" : "定时发布" }
-    var icon: String { self == .download ? "arrow.down.circle" : "paperplane.circle" }
+    var title: String {
+        switch self {
+        case .single: "单次发布"
+        case .scheduled: "定时发布"
+        case .history: "发布记录"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .single: "paperplane.circle"
+        case .scheduled: "clock"
+        case .history: "clock.arrow.circlepath"
+        }
+    }
 }
 
 struct ProfileParseResponse: Codable {
@@ -400,7 +413,6 @@ struct TencentCLIUserData: Codable {
 enum WorkspaceSection: String, CaseIterable, Identifiable {
     case download
     case publish
-    case schedule
     case log
 
     var id: String { rawValue }
@@ -408,7 +420,6 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
         switch self {
         case .download: "下载"
         case .publish: "发布"
-        case .schedule: "定时"
         case .log: "日志"
         }
     }
@@ -416,7 +427,6 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
         switch self {
         case .download: "arrow.down.circle"
         case .publish: "paperplane.circle"
-        case .schedule: "clock"
         case .log: "terminal"
         }
     }
@@ -1828,9 +1838,9 @@ struct ContentView: View {
     @StateObject private var model = AppModel()
     @State private var section: WorkspaceSection = .download
     @State private var downloadMode: DownloadMode = .profiles
+    @State private var publishMode: PublishMode = .single
     @State private var showAddProfile = false
     @State private var cookieExpanded = false
-    @State private var scheduleMode: ScheduleMode = .download
     @State private var showAddDownloadSchedule = false
     @State private var showAddPublishSchedule = false
     @State private var scheduleProfileDraft = ""
@@ -1865,6 +1875,12 @@ struct ContentView: View {
         .onAppear {
             model.startSchedulerMonitor()
         }
+        .sheet(isPresented: $showAddDownloadSchedule) {
+            addDownloadScheduleSheet
+        }
+        .sheet(isPresented: $showAddPublishSchedule) {
+            addPublishScheduleSheet
+        }
     }
 
     private var header: some View {
@@ -1884,7 +1900,7 @@ struct ContentView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Color.accentColor)
             }
-            Text("v1.0.4")
+            Text("v1.0.5")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 8)
@@ -1950,8 +1966,6 @@ struct ContentView: View {
             downloadView
         case .publish:
             publishView
-        case .schedule:
-            scheduleView
         case .log:
             logView
         }
@@ -2150,12 +2164,13 @@ struct ContentView: View {
 
     private var profileTaskHeader: some View {
         HStack(spacing: 12) {
-            Text("UP 主 / 主页").frame(maxWidth: .infinity, alignment: .leading)
+            Text("备注 / 主页").frame(maxWidth: .infinity, alignment: .leading)
             Text("平台").frame(width: 82, alignment: .leading)
             Text("本地已有").frame(width: 72, alignment: .leading)
             Text("下载方式").frame(width: 92, alignment: .leading)
             Text("数量").frame(width: 58, alignment: .leading)
             Text("进度").frame(width: 170, alignment: .leading)
+            Text("定时").frame(width: 150, alignment: .leading)
             Text("操作").frame(width: 94, alignment: .leading)
         }
         .font(.caption)
@@ -2167,16 +2182,18 @@ struct ContentView: View {
     private func profileTaskRow(profile: Binding<DownloadProfile>) -> some View {
         let current = profile.wrappedValue
         let progress = model.profileProgress[current.id] ?? DownloadTaskProgress()
+        let scheduleTask = model.config.automation.download_tasks.first { $0.profile_id == current.id }
         return HStack(spacing: 12) {
             HStack(spacing: 9) {
                 Image(systemName: "person.crop.rectangle.stack")
                     .foregroundStyle(Color.accentColor)
                 VStack(alignment: .leading, spacing: 3) {
-                    TextField("UP 主名称", text: profile.name)
+                    TextField("备注", text: profile.name)
                         .font(.headline)
                         .textFieldStyle(.plain)
                         .lineLimit(1)
                         .disabled(model.isProfileDownloading(current.id))
+                        .help("可编辑备注；默认使用解析到的 UP 主名称")
                     Link(current.url, destination: URL(string: current.url) ?? URL(fileURLWithPath: "/"))
                         .font(.caption)
                         .lineLimit(1)
@@ -2223,6 +2240,39 @@ struct ContentView: View {
             .frame(width: 170)
 
             HStack(spacing: 6) {
+                if let scheduleTask {
+                    Button {
+                        model.setScheduledDownloadTaskEnabled(scheduleTask, enabled: !scheduleTask.enabled)
+                    } label: {
+                        Image(systemName: scheduleTask.enabled ? "pause.circle" : "play.circle")
+                    }
+                    .help(scheduleTask.enabled ? "停止定时下载" : "开启定时下载")
+                    Button {
+                        editDownloadSchedule(scheduleTask, fallbackProfileID: current.id)
+                    } label: {
+                        Image(systemName: "clock.badge.checkmark")
+                    }
+                    .help("修改定时下载")
+                    Button(role: .destructive) {
+                        model.deleteScheduledDownloadTask(scheduleTask)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .help("删除定时下载")
+                } else {
+                    Button {
+                        editDownloadSchedule(nil, fallbackProfileID: current.id)
+                    } label: {
+                        Label("定时", systemImage: "clock.badge.plus")
+                    }
+                    .font(.caption)
+                    .help("为这个 UP 主设置定时下载")
+                }
+            }
+            .buttonStyle(.borderless)
+            .frame(width: 150, alignment: .leading)
+
+            HStack(spacing: 6) {
                 if model.isProfileDownloading(current.id) {
                     Button { model.stopProfileDownload(current) } label: {
                         Image(systemName: "stop.circle.fill")
@@ -2247,10 +2297,20 @@ struct ContentView: View {
         .padding(.vertical, 11)
     }
 
+    private func editDownloadSchedule(_ task: ScheduledDownloadTask?, fallbackProfileID: String) {
+        editingDownloadTask = task
+        scheduleProfileDraft = task?.profile_id ?? fallbackProfileID
+        scheduleIntervalDraft = task?.interval_minutes ?? 60
+        scheduleStartDraft = task.flatMap { $0.active_start.isEmpty ? nil : $0.active_start } ?? "09:00"
+        scheduleEndDraft = task.flatMap { $0.active_end.isEmpty ? nil : $0.active_end } ?? "23:00"
+        showAddDownloadSchedule = true
+    }
+
     private var publishView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 titleRow("发布到频道", icon: "paperplane.circle.fill")
+                publishTabs
                 panel {
                     VStack(alignment: .leading, spacing: 10) {
                         Label("频道账号", systemImage: "person.crop.circle.badge.checkmark")
@@ -2279,67 +2339,15 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                if model.tencentStatusOK {
-                    panel {
-                        Label("视频来源", systemImage: "folder.fill")
-                            .font(.headline)
-                        HStack(spacing: 12) {
-                            field("mp4 目录", text: $model.config.publish.input_dir)
-                            Button { model.choosePublishDirectory() } label: {
-                                Label("选择", systemImage: "folder")
-                            }
-                            Button { model.openPublishDirectory() } label: {
-                                Image(systemName: "arrow.up.right.square")
-                            }
-                        }
-                        HStack(spacing: 12) {
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text("发布范围").font(.caption).foregroundStyle(.secondary)
-                                Picker("", selection: $model.config.publish.scope) {
-                                    Text("创作者全局贴").tag("author_global")
-                                    Text("频道内发帖").tag("channel")
-                                }
-                                .pickerStyle(.segmented)
-                            }
-                            intField("每次发布", value: $model.config.publish.limit)
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text("帖子类型").font(.caption).foregroundStyle(.secondary)
-                                Picker("", selection: $model.config.publish.feed_type) {
-                                    Text("短帖").tag(1)
-                                    Text("长帖").tag(2)
-                                }
-                                .pickerStyle(.segmented)
-                            }
-                        }
-                        HStack(spacing: 12) {
-                            field("频道ID", text: $model.config.publish.guild_id)
-                            field("版块ID", text: $model.config.publish.channel_id)
-                        }
-                        .disabled(model.config.publish.scope != "channel")
+                if model.tencentStatusOK || publishMode == .history {
+                    switch publishMode {
+                    case .single:
+                        singlePublishPanel
+                    case .scheduled:
+                        scheduledPublishTaskList
+                    case .history:
+                        publishHistoryPanel
                     }
-                    panel {
-                        Label("帖子规则", systemImage: "slider.horizontal.3")
-                            .font(.headline)
-                        HStack(spacing: 12) {
-                            field("标题模板", text: $model.config.publish.title_template)
-                            field("正文模板", text: $model.config.publish.content_template)
-                        }
-                        HStack(spacing: 18) {
-                            Toggle("剔除 # 和 @", isOn: $model.config.publish.strip_tags_mentions)
-                            Toggle("手动发布成功后删除", isOn: $model.config.publish.delete_after_publish)
-                            Spacer()
-                        }
-                        Text("发布失败时会自动重试 2 次。最终仍失败的视频会保留在原目录，并记录为失败，不会进入已发布去重。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    commandBar {
-                        Button { model.runPublish() } label: {
-                            Label("开始发布", systemImage: "paperplane.circle.fill")
-                        }
-                        .keyboardShortcut("p", modifiers: [.command])
-                    }
-                    publishHistoryPanel
                 } else {
                     VStack(spacing: 8) {
                         Image(systemName: "lock.shield")
@@ -2358,24 +2366,89 @@ struct ContentView: View {
         }
     }
 
-    private var scheduleView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                titleRow("定时任务", icon: "clock.fill")
-                scheduleTabs
-                if scheduleMode == .download {
-                    scheduledDownloadTaskList
-                } else {
-                    scheduledPublishTaskList
+    private var publishTabs: some View {
+        HStack(spacing: 8) {
+            ForEach(PublishMode.allCases) { mode in
+                Button {
+                    publishMode = mode
+                } label: {
+                    Label(mode.title, systemImage: mode.icon)
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(publishMode == mode ? .white : .primary)
+                .background(publishMode == mode ? Color.accentColor : Color(NSColor.controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 7))
             }
-            .padding(22)
         }
-        .sheet(isPresented: $showAddDownloadSchedule) {
-            addDownloadScheduleSheet
-        }
-        .sheet(isPresented: $showAddPublishSchedule) {
-            addPublishScheduleSheet
+        .padding(6)
+        .background(Color(NSColor.windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var singlePublishPanel: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            panel {
+                Label("视频来源", systemImage: "folder.fill")
+                    .font(.headline)
+                HStack(spacing: 12) {
+                    field("mp4 目录", text: $model.config.publish.input_dir)
+                    Button { model.choosePublishDirectory() } label: {
+                        Label("选择", systemImage: "folder")
+                    }
+                    Button { model.openPublishDirectory() } label: {
+                        Image(systemName: "arrow.up.right.square")
+                    }
+                }
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("发布范围").font(.caption).foregroundStyle(.secondary)
+                        Picker("", selection: $model.config.publish.scope) {
+                            Text("创作者全局贴").tag("author_global")
+                            Text("频道内发帖").tag("channel")
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                    intField("每次发布", value: $model.config.publish.limit)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("帖子类型").font(.caption).foregroundStyle(.secondary)
+                        Picker("", selection: $model.config.publish.feed_type) {
+                            Text("短帖").tag(1)
+                            Text("长帖").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                }
+                HStack(spacing: 12) {
+                    field("频道ID", text: $model.config.publish.guild_id)
+                    field("版块ID", text: $model.config.publish.channel_id)
+                }
+                .disabled(model.config.publish.scope != "channel")
+            }
+            panel {
+                Label("帖子规则", systemImage: "slider.horizontal.3")
+                    .font(.headline)
+                HStack(spacing: 12) {
+                    field("标题模板", text: $model.config.publish.title_template)
+                    field("正文模板", text: $model.config.publish.content_template)
+                }
+                HStack(spacing: 18) {
+                    Toggle("剔除 # 和 @", isOn: $model.config.publish.strip_tags_mentions)
+                    Toggle("手动发布成功后删除", isOn: $model.config.publish.delete_after_publish)
+                    Spacer()
+                }
+                Text("发布失败时会自动重试 2 次。最终仍失败的视频会保留在原目录，并记录为失败，不会进入已发布去重。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            commandBar {
+                Button { model.runPublish() } label: {
+                    Label("开始发布", systemImage: "paperplane.circle.fill")
+                }
+                .keyboardShortcut("p", modifiers: [.command])
+            }
         }
     }
 
@@ -2461,115 +2534,6 @@ struct ContentView: View {
                         Image(systemName: "chevron.right")
                     }
                     .disabled(safePage >= pageCount - 1)
-                }
-            }
-        }
-    }
-
-    private var scheduleTabs: some View {
-        HStack(spacing: 8) {
-            ForEach(ScheduleMode.allCases) { mode in
-                Button {
-                    scheduleMode = mode
-                } label: {
-                    Label(mode.title, systemImage: mode.icon)
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(scheduleMode == mode ? .white : .primary)
-                .background(scheduleMode == mode ? Color.accentColor : Color(NSColor.controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 7))
-            }
-        }
-        .padding(6)
-        .background(Color(NSColor.windowBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var scheduledDownloadTaskList: some View {
-        panel {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("定时下载任务").font(.headline)
-                    Text("从 UP 主清单中选择账号，定期同步未下载的视频。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button {
-                    editingDownloadTask = nil
-                    scheduleProfileDraft = model.config.download.profiles.first?.id ?? ""
-                    scheduleIntervalDraft = 60
-                    scheduleStartDraft = "09:00"
-                    scheduleEndDraft = "23:00"
-                    showAddDownloadSchedule = true
-                } label: {
-                    Label("添加定时下载", systemImage: "plus.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.config.download.profiles.isEmpty)
-            }
-            Divider()
-            if model.config.automation.download_tasks.isEmpty {
-                scheduleEmptyState("还没有定时下载任务", detail: "先在下载页添加 UP 主，再创建同步任务。")
-            } else {
-                ForEach($model.config.automation.download_tasks) { $task in
-                    HStack(spacing: 12) {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .foregroundStyle(Color.accentColor)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(scheduleProfileName(task.profile_id))
-                                .font(.headline)
-                                .lineLimit(1)
-                            Text("每 \(task.interval_minutes) 分钟同步一次")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        TextField("分钟", value: $task.interval_minutes, format: .number)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 54)
-                            .help("执行间隔分钟")
-                        scheduleWindowFields(start: $task.active_start, end: $task.active_end)
-                        if let progress = model.profileProgress[task.profile_id], progress.total > 0 {
-                            Text("\(progress.completed)/\(progress.total)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        statusPill(
-                            text: model.scheduledDownloadStatus(for: task),
-                            ok: task.enabled
-                        )
-                        Button {
-                            model.setScheduledDownloadTaskEnabled(task, enabled: !task.enabled)
-                        } label: {
-                            Image(systemName: task.enabled ? "stop.circle" : "play.circle")
-                        }
-                        .buttonStyle(.borderless)
-                        .help(task.enabled ? "停止这个定时下载任务" : "开启这个定时下载任务")
-                        Button {
-                            editingDownloadTask = task
-                            scheduleProfileDraft = task.profile_id
-                            scheduleIntervalDraft = task.interval_minutes
-                            scheduleStartDraft = task.active_start
-                            scheduleEndDraft = task.active_end
-                            showAddDownloadSchedule = true
-                        } label: {
-                            Image(systemName: "pencil")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("修改任务")
-                        Button(role: .destructive) {
-                            model.deleteScheduledDownloadTask(task)
-                        } label: {
-                            Image(systemName: "trash")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("删除任务")
-                    }
-                    .padding(.vertical, 4)
                 }
             }
         }
@@ -2690,9 +2654,9 @@ struct ContentView: View {
 
     private var addDownloadScheduleSheet: some View {
         VStack(alignment: .leading, spacing: 18) {
-            titleRow(editingDownloadTask == nil ? "添加定时下载" : "修改定时下载", icon: "arrow.down.circle.fill")
+            titleRow(editingDownloadTask == nil ? "设置 UP 主定时下载" : "修改 UP 主定时下载", icon: "arrow.down.circle.fill")
             VStack(alignment: .leading, spacing: 5) {
-                Text("选择 UP 主").font(.caption).foregroundStyle(.secondary)
+                Text("UP 主").font(.caption).foregroundStyle(.secondary)
                 Picker("选择 UP 主", selection: $scheduleProfileDraft) {
                     ForEach(model.config.download.profiles) { profile in
                         Text(profile.name.isEmpty ? profile.url : profile.name).tag(profile.id)
@@ -2832,13 +2796,6 @@ struct ContentView: View {
         }
         .padding(22)
         .frame(width: 760, height: 390)
-    }
-
-    private func scheduleProfileName(_ profileID: String) -> String {
-        guard let profile = model.config.download.profiles.first(where: { $0.id == profileID }) else {
-            return "UP 主已删除"
-        }
-        return profile.name.isEmpty ? profile.url : profile.name
     }
 
     private var logView: some View {
