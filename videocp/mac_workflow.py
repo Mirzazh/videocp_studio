@@ -121,7 +121,7 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
     base_dir = app_config_path.parent
     download_raw = app_config.get("download") or {}
     inputs = _split_inputs(str(download_raw.get("inputs_text", "")))
-    output_dir = resolve_config_path(download_raw.get("output_dir", "./downloads"), base_dir)
+    output_dir_raw = str(download_raw.get("output_dir") or "").strip()
     history_file = resolve_config_path(download_raw.get("history_file", "./download_history_mac.json"), base_dir)
     count = max(1, int(download_raw.get("count") or 1))
     order = str(download_raw.get("order") or "latest").strip().lower()
@@ -144,7 +144,10 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
 
     if not inputs:
         return [WorkflowResult(ok=False, action="failed", error="请先填写下载链接或主页链接").to_dict()]
+    if not output_dir_raw:
+        return [WorkflowResult(ok=False, action="failed", error="请先选择视频保存位置").to_dict()]
 
+    output_dir = resolve_config_path(output_dir_raw, base_dir)
     app_cfg = _workflow_app_config(base_dir, output_dir)
     history = load_history(history_file)
     publish_history_file = resolve_config_path(

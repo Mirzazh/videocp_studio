@@ -57,7 +57,7 @@ struct DownloadSettings: Codable {
     var profile_url_draft: String = ""
     var profiles: [DownloadProfile] = []
     var inputs_text: String = ""
-    var output_dir: String = "./downloads"
+    var output_dir: String = ""
     var history_file: String = "./download_history_mac.json"
     var order: String = "latest"
     var count: Int = 3
@@ -732,14 +732,38 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func openDownloadDirectory() { openPath(config.download.output_dir) }
+    func openDownloadDirectory() {
+        guard requireDownloadDirectory() else { return }
+        openPath(config.download.output_dir)
+    }
     func openPublishDirectory() { openPath(config.publish.input_dir) }
+
+    var downloadDirectoryReady: Bool {
+        let path = config.download.output_dir.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !path.isEmpty
+    }
+
+    var downloadDirectoryLabel: String {
+        let path = config.download.output_dir.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return "未选择" }
+        return URL(fileURLWithPath: (path as NSString).expandingTildeInPath).lastPathComponent
+    }
+
+    private func requireDownloadDirectory() -> Bool {
+        guard downloadDirectoryReady else {
+            reportIssue("请先选择视频保存位置")
+            appendLog("请先选择视频保存位置")
+            return false
+        }
+        return true
+    }
 
     func resetSingleDownloadProgress() {
         singleDownloadProgress = SingleDownloadProgress()
     }
 
     func runSingleDownload(forceRedownload: Bool = false) {
+        guard requireDownloadDirectory() else { return }
         let url = config.download.single_video_url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !url.isEmpty else {
             appendLog("请先填写单视频链接")
@@ -778,6 +802,7 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func runProfileDownload(_ profile: DownloadProfile, scheduleTaskID: String? = nil) -> Bool {
+        guard requireDownloadDirectory() else { return false }
         guard !isProfileDownloading(profile.id) else {
             appendLog("主页下载已在运行: \(profile.name.isEmpty ? profile.url : profile.name)")
             reportIssue("这个主页正在下载中")
@@ -1675,6 +1700,7 @@ final class AppModel: ObservableObject {
     }
 
     func localVideoCount(for profile: DownloadProfile) -> Int {
+        guard downloadDirectoryReady else { return 0 }
         let root = URL(fileURLWithPath: (config.download.output_dir as NSString).expandingTildeInPath)
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else { return 0 }
         let expectedPlatform = platformName(for: profile.url).lowercased()
@@ -1858,7 +1884,7 @@ struct ContentView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Color.accentColor)
             }
-            Text("v1.0.3")
+            Text("v1.0.4")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 8)
@@ -1950,38 +1976,25 @@ struct ContentView: View {
                         .background(downloadMode == mode ? Color.accentColor : Color(NSColor.controlBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 7))
                     }
-                    Menu {
-                        Button { model.chooseDownloadDirectory() } label: {
-                            Label("选择保存位置", systemImage: "folder.badge.plus")
-                        }
-                        Button { model.openDownloadDirectory() } label: {
-                            Label("打开保存位置", systemImage: "arrow.up.right.square")
-                        }
-                    } label: {
-                        Label("保存位置", systemImage: "folder")
-                            .font(.headline)
-                            .padding(.horizontal, 13)
-                            .padding(.vertical, 11)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
                 }
                 .padding(6)
                 .background(Color(NSColor.controlBackgroundColor))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                downloadLocationPanel
 
                 if downloadMode == .single {
                     panel {
-                        Text("单视频下载").font(.headline)
-                        Text("粘贴一个视频链接，下载完成后会自动写入标题信息并检查本地去重。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack {
+                            Text("单视频下载").font(.headline)
+                            Spacer()
+                            requirementPill(text: model.downloadDirectoryReady ? "保存位置已选择" : "先选择保存位置", ok: model.downloadDirectoryReady)
+                        }
                         HStack(spacing: 12) {
                             field("视频链接", text: $model.config.download.single_video_url)
                             Button { model.runSingleDownload() } label: {
                                 Label("下载视频", systemImage: "arrow.down.circle.fill")
                             }
-                            .disabled(model.busy)
+                            .disabled(model.busy || !model.downloadDirectoryReady)
                         }
                         .onChange(of: model.config.download.single_video_url) {
                             model.resetSingleDownloadProgress()
@@ -2065,6 +2078,7 @@ struct ContentView: View {
                 Text("\(model.config.download.profiles.count) 个来源")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                requirementPill(text: model.downloadDirectoryReady ? "可开始下载" : "先选择保存位置", ok: model.downloadDirectoryReady)
                 Spacer()
                 Button {
                     model.config.download.profile_url_draft = ""
@@ -2103,6 +2117,35 @@ struct ContentView: View {
         .padding(14)
         .background(Color(NSColor.controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var downloadLocationPanel: some View {
+        panel {
+            HStack(spacing: 12) {
+                Image(systemName: model.downloadDirectoryReady ? "folder.fill.badge.checkmark" : "folder.badge.questionmark")
+                    .font(.title2)
+                    .foregroundStyle(model.downloadDirectoryReady ? Color.green : Color.orange)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("保存位置")
+                        .font(.headline)
+                    Text(model.downloadDirectoryReady ? model.config.download.output_dir : "请选择一个本地文件夹后再开始下载")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                Button { model.chooseDownloadDirectory() } label: {
+                    Label(model.downloadDirectoryReady ? "更换位置" : "选择文件夹", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(.borderedProminent)
+                Button { model.openDownloadDirectory() } label: {
+                    Label("打开", systemImage: "arrow.up.right.square")
+                }
+                .disabled(!model.downloadDirectoryReady)
+            }
+        }
     }
 
     private var profileTaskHeader: some View {
@@ -2190,6 +2233,7 @@ struct ContentView: View {
                         Image(systemName: "arrow.down.circle")
                     }
                     .help("下载这个主页的新视频")
+                    .disabled(!model.downloadDirectoryReady)
                 }
                 Button(role: .destructive) { model.deleteProfile(current) } label: {
                     Image(systemName: "trash")
@@ -2870,6 +2914,17 @@ struct ContentView: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background((ok ? Color.green : Color.secondary).opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func requirementPill(text: String, ok: Bool) -> some View {
+        Label(text, systemImage: ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(ok ? Color.green : Color.orange)
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background((ok ? Color.green : Color.orange).opacity(0.12))
             .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 

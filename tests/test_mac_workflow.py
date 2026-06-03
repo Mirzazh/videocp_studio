@@ -45,6 +45,30 @@ def test_download_from_app_config_writes_cookie_text_and_uses_youtube_defaults(t
     assert "YSC\tdemo" in cookie_text
 
 
+def test_download_requires_explicit_output_dir(tmp_path: Path):
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps({"download": {"inputs_text": "https://www.youtube.com/shorts/demo", "output_dir": ""}}),
+        encoding="utf-8",
+    )
+
+    result = run_download_from_app_config(config_path)
+
+    assert result == [
+        {
+            "ok": False,
+            "action": "failed",
+            "path": "",
+            "content_id": "",
+            "title": "",
+            "feed_id": "",
+            "share_url": "",
+            "error": "请先选择视频保存位置",
+        }
+    ]
+    assert not (tmp_path / "downloads").exists()
+
+
 def test_download_from_app_config_records_history_and_reuses_it_after_file_removal(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "mac-app.json"
     history_path = tmp_path / "download-history.json"
@@ -123,6 +147,7 @@ def test_download_from_app_config_force_redownload_bypasses_history(tmp_path: Pa
             {
                 "download": {
                     "inputs_text": "https://www.youtube.com/shorts/cid-1",
+                    "output_dir": str(tmp_path / "downloads"),
                     "history_file": str(history_path),
                 }
             }
@@ -166,7 +191,10 @@ def test_download_from_app_config_skips_items_in_publish_history(tmp_path: Path,
     config_path.write_text(
         json.dumps(
             {
-                "download": {"inputs_text": "https://www.youtube.com/shorts/published-id"},
+                "download": {
+                    "inputs_text": "https://www.youtube.com/shorts/published-id",
+                    "output_dir": str(tmp_path / "downloads"),
+                },
                 "publish": {"history_file": str(publish_history_path)},
             }
         ),

@@ -18,7 +18,7 @@
   },
   "download": {
     "inputs_text": "https://www.youtube.com/@example/shorts",
-    "output_dir": "./downloads",
+    "output_dir": "",
     "history_file": "./download_history_mac.json",
     "order": "latest",
     "count": 3,

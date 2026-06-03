@@ -34,7 +34,7 @@ DEFAULT_APP_CONFIG = {
     },
     "download": {
         "inputs_text": "",
-        "output_dir": "./downloads",
+        "output_dir": "",
         "history_file": "./download_history_mac.json",
         "order": "latest",
         "count": 3,
