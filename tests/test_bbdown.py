@@ -219,7 +219,7 @@ def test_download_bilibili_with_bbdown_uses_python_tv_pipeline(tmp_path: Path, m
 
     assert extraction.metadata.aweme_id == "BV1764y1y76G"
     assert extraction.metadata.author == "UP主"
-    assert extraction.diagnostics["downloader"] == "bbdown_python_tv"
+    assert extraction.diagnostics["downloader"] == "bbdown_python"
     assert artifact.output_path.is_file()
 
 

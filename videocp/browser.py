@@ -138,6 +138,13 @@ def write_persisted_cdp_url(profile_dir: Path, cdp_url: str) -> None:
         return
 
 
+def clear_persisted_cdp_url(profile_dir: Path) -> None:
+    try:
+        persisted_cdp_url_path(profile_dir).unlink(missing_ok=True)
+    except OSError:
+        return
+
+
 def read_existing_cdp_url(profile_dir: Path) -> str:
     active_port_file = profile_dir / DEVTOOLS_ACTIVE_PORT_FILE
     try:
@@ -237,6 +244,82 @@ def _ensure_headless_match(config: BrowserConfig) -> None:
 def format_exception(exc: Exception) -> str:
     text = str(exc).strip()
     return text or f"{type(exc).__name__}(no message)"
+
+
+def is_unsupported_context_management_error(error: str) -> bool:
+    normalized = str(error or "").lower()
+    return (
+        "browser.setdownloadbehavior" in normalized
+        and "context management is not supported" in normalized
+    )
+
+
+def terminate_process_tree(proc: subprocess.Popen[str] | None, *, timeout: float = 5.0) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    log_info("browser.process.stop", pid=proc.pid)
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        return
+    try:
+        proc.kill()
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def terminate_browser_processes_for_profile(profile_dir: Path, *, port: int | None = None) -> list[int]:
+    if os.name != "posix":
+        return []
+    try:
+        proc = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    if proc.returncode != 0:
+        return []
+    profile_needle = f"--user-data-dir={profile_dir}"
+    port_needle = f"--remote-debugging-port={port}" if port else ""
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        if profile_needle not in line:
+            continue
+        if port_needle and port_needle not in line:
+            continue
+        match = re.match(r"\s*(\d+)\s+", line)
+        if match is None:
+            continue
+        pids.append(int(match.group(1)))
+    for pid in pids:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            continue
+    deadline = time.monotonic() + 3.0
+    for pid in pids:
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.1)
+        else:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+    if pids:
+        log_info("browser.profile.processes.stopped", profile_dir=profile_dir, pids=pids)
+    return pids
 
 
 def try_connect_cdp(playwright: Playwright, cdp_url: str) -> tuple[Browser | None, str]:
@@ -440,6 +523,18 @@ class BrowserSession:
                 contexts=len(contexts),
             )
             return browser, context
+        if is_unsupported_context_management_error(pre_error):
+            parsed = parse_cdp_url(self.config.cdp_url)
+            terminate_browser_processes_for_profile(self.config.profile_dir, port=parsed.port)
+            clear_persisted_cdp_url(self.config.profile_dir)
+            clear_profile_transient_artifacts(self.config.profile_dir)
+            self.config.cdp_url = build_cdp_url(find_free_local_port())
+            log_warn(
+                "browser.cdp.unsupported_context.cleanup",
+                old_cdp_url=f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                new_cdp_url=self.config.cdp_url,
+                error=pre_error,
+            )
         log_info("browser.cdp.connect.miss", cdp_url=self.config.cdp_url, error=pre_error or "none")
 
         self.launched_proc = launch_detached_browser_process(self.playwright, self.config)
@@ -485,6 +580,11 @@ class BrowserSession:
             if wait_error_2:
                 wait_error = wait_error_2
         launch_diag = collect_launch_diagnostics(self.launched_proc)
+        if self.launched_proc is not None and self.launched_proc.poll() is None:
+            terminate_process_tree(self.launched_proc)
+        self.launched_proc = None
+        clear_persisted_cdp_url(self.config.profile_dir)
+        clear_profile_transient_artifacts(self.config.profile_dir)
         log_warn(
             "browser.cdp.connect.failed",
             cdp_url=self.config.cdp_url,
@@ -493,7 +593,8 @@ class BrowserSession:
             launch=launch_diag,
         )
         raise RuntimeError(
-            "Failed to connect detached browser over CDP. "
+            "无法连接 App 启动的 Chrome 调试会话，已自动关闭本次打开的空白 Chrome。"
+            "请重新点一次下载；如果仍失败，请关闭 Chrome 后再试。"
             f"{profile_lock_hint(self.config.profile_dir)} "
             f"pre_connect_error={pre_error}; "
             f"post_launch_connect_error={wait_error}; "
@@ -568,16 +669,24 @@ def get_global_browser(config: BrowserConfig) -> GlobalBrowserRuntime:
                 browser_path=config.browser_path,
                 cdp_url=config.cdp_url,
             )
-            bootstrap = BrowserSession(config, terminate_on_close=False).open()
-            launched_proc = bootstrap.launched_proc
-            bootstrap.launched_proc = None
-            _GLOBAL_BROWSER = GlobalBrowserRuntime(
-                config=bootstrap.config,
-                launched_proc=launched_proc,
-                seed_status=bootstrap.seed_status,
-                seed_source=bootstrap.seed_source,
-                runtime_mode=bootstrap.runtime_mode,
-            )
+            bootstrap = BrowserSession(config, terminate_on_close=False)
+            try:
+                bootstrap.open()
+                launched_proc = bootstrap.launched_proc
+                bootstrap.launched_proc = None
+                _GLOBAL_BROWSER = GlobalBrowserRuntime(
+                    config=bootstrap.config,
+                    launched_proc=launched_proc,
+                    seed_status=bootstrap.seed_status,
+                    seed_source=bootstrap.seed_source,
+                    runtime_mode=bootstrap.runtime_mode,
+                )
+            except Exception:
+                bootstrap.terminate_on_close = True
+                bootstrap.close()
+                clear_persisted_cdp_url(config.profile_dir)
+                clear_profile_transient_artifacts(config.profile_dir)
+                raise
             bootstrap.close()
             atexit.register(close_global_browser)
             return _GLOBAL_BROWSER

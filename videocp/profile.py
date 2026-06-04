@@ -258,6 +258,8 @@ def prepare_profile_seed_once(profile_dir: Path, executable_path: str) -> tuple[
 
 def clear_profile_transient_artifacts(profile_dir: Path) -> list[str]:
     removed: list[str] = []
+    if not profile_dir.exists():
+        return removed
     for entry in profile_dir.iterdir():
         name = entry.name
         lowered = name.lower()

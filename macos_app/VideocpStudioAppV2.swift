@@ -868,8 +868,8 @@ final class AppModel: ObservableObject {
     }
 
     func parseProfileDraft() {
-        let url = config.download.profile_url_draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !url.isEmpty else {
+        let urls = profileDraftURLs()
+        guard !urls.isEmpty else {
             appendLog("请先填写主页 URL")
             reportIssue("请先填写主页 URL")
             return
@@ -881,35 +881,73 @@ final class AppModel: ObservableObject {
         }
         save()
         busy = true
-        status = "正在解析主页"
-        appendLog("解析主页: \(url)")
+        status = urls.count > 1 ? "正在批量解析主页" : "正在解析主页"
+        appendLog(urls.count > 1 ? "批量解析主页: \(urls.count) 个" : "解析主页: \(urls[0])")
         DispatchQueue.global(qos: .userInitiated).async {
-            let process = self.makeProcess(arguments: ["app-parse-profile", "--app-config", self.configURL.path, "--url", url])
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-            do {
-                try process.run()
-                process.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let text = String(data: data, encoding: .utf8) ?? ""
-                DispatchQueue.main.async {
-                    self.busy = false
-                    self.status = process.terminationStatus == 0 ? "主页解析完成" : "主页解析失败"
-                    self.handleProfileParseOutput(text, fallbackURL: url)
+            var succeeded = 0
+            var failed = 0
+            for (index, url) in urls.enumerated() {
+                DispatchQueue.main.sync {
+                    self.status = "正在解析主页 \(index + 1)/\(urls.count)"
+                    self.appendLog("解析主页: \(url)")
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    self.busy = false
-                    self.status = "主页解析失败"
-                    self.appendLog("解析启动失败: \(error.localizedDescription)")
-                    self.reportIssue("主页解析启动失败：\(error.localizedDescription)")
+                let process = self.makeProcess(arguments: ["app-parse-profile", "--app-config", self.configURL.path, "--url", url])
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = pipe
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let text = String(data: data, encoding: .utf8) ?? ""
+                    var ok = false
+                    DispatchQueue.main.sync {
+                        ok = self.handleProfileParseOutput(text, fallbackURL: url, clearDraft: false)
+                    }
+                    if process.terminationStatus == 0 && ok {
+                        succeeded += 1
+                    } else {
+                        failed += 1
+                    }
+                } catch {
+                    failed += 1
+                    DispatchQueue.main.sync {
+                        self.appendLog("解析启动失败: \(url) \(error.localizedDescription)")
+                        self.reportIssue("主页解析启动失败：\(error.localizedDescription)")
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                self.busy = false
+                self.config.download.profile_url_draft = ""
+                self.save()
+                if failed == 0 {
+                    self.status = "主页解析完成"
+                    self.reportInfo("已添加 \(succeeded) 个 UP 主")
+                } else {
+                    self.status = "部分主页解析失败"
+                    self.reportIssue("已添加 \(succeeded) 个 UP 主，\(failed) 个解析失败")
                 }
             }
         }
     }
 
-    private func handleProfileParseOutput(_ text: String, fallbackURL: String) {
+    private func profileDraftURLs() -> [String] {
+        let raw = config.download.profile_url_draft
+        var seen: Set<String> = []
+        return raw
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .filter { value in
+                if seen.contains(value) { return false }
+                seen.insert(value)
+                return true
+            }
+    }
+
+    @discardableResult
+    private func handleProfileParseOutput(_ text: String, fallbackURL: String, clearDraft: Bool = true) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let jsonText: String
         if let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}") {
@@ -921,12 +959,12 @@ final class AppModel: ObservableObject {
               let response = try? JSONDecoder().decode(ProfileParseResponse.self, from: data) else {
             appendLog("主页解析返回异常: \(trimmed)")
             reportIssue("主页解析返回异常，请检查网络或重新安装 App")
-            return
+            return false
         }
         guard response.ok else {
             appendLog("主页解析失败: \(response.error)")
             reportIssue("主页解析失败：\(response.error)")
-            return
+            return false
         }
         let name = response.name.isEmpty ? fallbackURL : response.name
         var profile = DownloadProfile(
@@ -949,9 +987,12 @@ final class AppModel: ObservableObject {
             config.download.profiles.append(profile)
             appendLog("已添加主页卡片: \(name)")
         }
-        config.download.profile_url_draft = ""
+        if clearDraft {
+            config.download.profile_url_draft = ""
+        }
         save()
         reportInfo("已添加 UP 主：\(profile.name)")
+        return true
     }
 
     private func chooseDirectory() -> String? {
@@ -1882,6 +1923,10 @@ struct ContentView: View {
     @State private var editingProfileNameID: String?
     @State private var publishHistoryPage = 0
     @State private var publishHistoryFilter = "all"
+    @State private var showLogSearch = false
+    @State private var logSearchText = ""
+    @State private var logSearchKeyMonitor: Any?
+    @FocusState private var logSearchFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1902,6 +1947,10 @@ struct ContentView: View {
         }
         .onAppear {
             model.startSchedulerMonitor()
+            installLogSearchShortcut()
+        }
+        .onDisappear {
+            removeLogSearchShortcut()
         }
         .sheet(isPresented: $showAddDownloadSchedule) {
             addDownloadScheduleSheet
@@ -1928,7 +1977,7 @@ struct ContentView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Color.accentColor)
             }
-            Text("v1.0.6")
+            Text("v1.0.7")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 8)
@@ -1997,6 +2046,46 @@ struct ContentView: View {
         case .log:
             logView
         }
+    }
+
+    private func installLogSearchShortcut() {
+        guard logSearchKeyMonitor == nil else { return }
+        logSearchKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            let wantsFind = key == "f" && (event.modifierFlags.contains(.command) || event.modifierFlags.contains(.control))
+            guard wantsFind else { return event }
+            guard section == .log else { return event }
+            showLogSearch = true
+            DispatchQueue.main.async {
+                logSearchFocused = true
+            }
+            return nil
+        }
+    }
+
+    private func removeLogSearchShortcut() {
+        if let monitor = logSearchKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            logSearchKeyMonitor = nil
+        }
+    }
+
+    private var visibleLogText: String {
+        let query = logSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return model.logs }
+        let lines = model.logs.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        return lines
+            .filter { $0.localizedCaseInsensitiveContains(query) }
+            .joined(separator: "\n")
+    }
+
+    private var visibleLogMatchCount: Int {
+        let query = logSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return 0 }
+        return model.logs
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { String($0).localizedCaseInsensitiveContains(query) }
+            .count
     }
 
     private var downloadView: some View {
@@ -2089,7 +2178,18 @@ struct ContentView: View {
         .sheet(isPresented: $showAddProfile) {
             VStack(alignment: .leading, spacing: 16) {
                 Text("添加 UP 主").font(.title2.bold())
-                field("主页 URL", text: $model.config.download.profile_url_draft)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("主页 URL")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $model.config.download.profile_url_draft)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 150)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.16)))
+                    Text("支持批量导入，一行一个主页链接。重复链接会自动忽略。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 pickerField("下载方式", selection: $model.config.download.order)
                 Text("每个 UP 主默认下载 30 条内容，添加后可在清单中单独修改。")
                     .font(.caption)
@@ -2109,7 +2209,7 @@ struct ContentView: View {
                 }
             }
             .padding(22)
-            .frame(width: 520)
+            .frame(width: 620)
         }
     }
 
@@ -2857,6 +2957,42 @@ struct ContentView: View {
                 Text(model.droppedLogLineCount > 0 ? "最近 \(model.logLineCount) 行，已省略 \(model.droppedLogLineCount) 行" : "最近 \(model.logLineCount) 行")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if showLogSearch {
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        TextField("搜索日志", text: $logSearchText)
+                            .textFieldStyle(.plain)
+                            .focused($logSearchFocused)
+                            .frame(width: 210)
+                        if !logSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text("\(visibleLogMatchCount)")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Button {
+                            logSearchText = ""
+                            showLogSearch = false
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Button {
+                        showLogSearch = true
+                        DispatchQueue.main.async {
+                            logSearchFocused = true
+                        }
+                    } label: {
+                        Label("搜索", systemImage: "magnifyingglass")
+                    }
+                    .keyboardShortcut("f", modifiers: [.command])
+                }
                 Button {
                     model.openLogDirectory()
                 } label: {
@@ -2876,7 +3012,7 @@ struct ContentView: View {
 
     private var logBox: some View {
         ScrollView {
-            Text(model.logs.isEmpty ? "暂无日志" : model.logs)
+            Text(logBoxText)
                 .font(.system(.caption, design: .monospaced))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
@@ -2885,6 +3021,17 @@ struct ContentView: View {
         .background(Color.black.opacity(0.05))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .frame(maxHeight: .infinity)
+    }
+
+    private var logBoxText: String {
+        if model.logs.isEmpty {
+            return "暂无日志"
+        }
+        let query = logSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            return model.logs
+        }
+        return visibleLogText.isEmpty ? "没有匹配的日志" : visibleLogText
     }
 
     private func titleRow(_ title: String, icon: String) -> some View {

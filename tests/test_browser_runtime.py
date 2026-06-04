@@ -6,6 +6,7 @@ from videocp.browser import (
     get_global_browser,
     merge_node_options,
 )
+import pytest
 
 
 def test_merge_node_options_deduplicates_flags():
@@ -152,3 +153,59 @@ def test_get_global_browser_closes_bootstrap_playwright_session(monkeypatch, tmp
     assert runtime.launched_proc is not None
 
     close_global_browser()
+
+
+def test_browser_session_cleans_failed_detached_chrome(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    (profile_dir / ".videocp_cdp_url").write_text("http://127.0.0.1:9222", encoding="utf-8")
+    (profile_dir / "DevToolsActivePort").write_text("9222\n/devtools/browser/test\n", encoding="utf-8")
+    (profile_dir / "SingletonLock").write_text("locked", encoding="utf-8")
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 789
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return None if not self.terminated and not self.killed else 0
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    fake_proc = FakeProc()
+    unsupported = (
+        "BrowserType.connect_over_cdp: Protocol error "
+        "(Browser.setDownloadBehavior): Browser context management is not supported"
+    )
+    monkeypatch.setattr("videocp.browser.try_connect_cdp", lambda *_: (None, unsupported))
+    monkeypatch.setattr("videocp.browser.wait_for_cdp", lambda *_: (None, unsupported))
+    monkeypatch.setattr("videocp.browser.launch_detached_browser_process", lambda *_: fake_proc)
+    monkeypatch.setattr("videocp.browser.probe_cdp_endpoint", lambda *_: {"tcp_ok": False, "http_ok": False})
+    monkeypatch.setattr("videocp.browser.terminate_browser_processes_for_profile", lambda *_, **__: [])
+
+    session = BrowserSession(
+        BrowserConfig(
+            profile_dir=profile_dir,
+            browser_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            cdp_url="http://127.0.0.1:9222",
+        ),
+        terminate_on_close=False,
+    )
+    session.playwright = object()
+
+    with pytest.raises(RuntimeError, match="已自动关闭"):
+        session._connect_or_launch()
+
+    assert fake_proc.terminated is True
+    assert not (profile_dir / ".videocp_cdp_url").exists()
+    assert not (profile_dir / "DevToolsActivePort").exists()
+    assert not (profile_dir / "SingletonLock").exists()
+    assert session.launched_proc is None
