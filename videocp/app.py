@@ -61,6 +61,7 @@ class DownloadOptions:
     watermark: WatermarkConfig | None = None
     profile_videos_count: int = 3
     profile_order: str = "latest"
+    bilibili_download_mode: str = "tv"
     ytdlp_extractor_args: str = ""
     ytdlp_cookies_file: Path | None = None
     ytdlp_remote_components: bool = False
@@ -458,6 +459,7 @@ def _download_bilibili_input(
     timeout_secs: int,
     watermark: WatermarkConfig | None = None,
     max_video_duration_secs: int = 0,
+    bilibili_download_mode: str = "tv",
 ) -> tuple[ExtractionResult, DownloadArtifact]:
     kwargs = {
         "source_url": parsed.canonical_url,
@@ -466,6 +468,7 @@ def _download_bilibili_input(
         "timeout_secs": timeout_secs,
         "watermark": watermark,
         "author_hint": parsed.author_hint,
+        "bilibili_download_mode": bilibili_download_mode,
     }
     if max_video_duration_secs > 0:
         kwargs["max_video_duration_secs"] = max_video_duration_secs
@@ -611,6 +614,7 @@ def _run_download_jobs(
     ytdlp_cookies_file: Path | None = None,
     ytdlp_remote_components: bool = False,
     force_redownload: bool = False,
+    bilibili_download_mode: str = "tv",
 ) -> list[DownloadJobResult]:
     results: list[DownloadJobResult | None] = [None] * len(prepared_inputs)
     total_limit = max(1, max_concurrent)
@@ -693,16 +697,32 @@ def _run_download_jobs(
                     output=artifact.output_path,
                 )
             elif parsed.provider_key == "bilibili":
-                kwargs = {
-                    "parsed": parsed,
-                    "browser_config": browser_config,
-                    "output_dir": output_dir,
-                    "timeout_secs": timeout_secs,
-                    "watermark": watermark,
-                }
-                if max_video_duration_secs > 0:
-                    kwargs["max_video_duration_secs"] = max_video_duration_secs
-                extraction, artifact = _download_bilibili_input(**kwargs)
+                if bilibili_download_mode == "ytdlp":
+                    kwargs = {
+                        "parsed": parsed,
+                        "browser_config": browser_config,
+                        "output_dir": output_dir,
+                        "timeout_secs": timeout_secs,
+                        "extractor_args": ytdlp_extractor_args,
+                        "cookies_file": ytdlp_cookies_file,
+                        "remote_components": ytdlp_remote_components,
+                        "force_redownload": force_redownload,
+                    }
+                    if max_video_duration_secs > 0:
+                        kwargs["max_video_duration_secs"] = max_video_duration_secs
+                    extraction, artifact = _download_ytdlp_input(**kwargs)
+                else:
+                    kwargs = {
+                        "parsed": parsed,
+                        "browser_config": browser_config,
+                        "output_dir": output_dir,
+                        "timeout_secs": timeout_secs,
+                        "watermark": watermark,
+                        "bilibili_download_mode": bilibili_download_mode,
+                    }
+                    if max_video_duration_secs > 0:
+                        kwargs["max_video_duration_secs"] = max_video_duration_secs
+                    extraction, artifact = _download_bilibili_input(**kwargs)
                 results[index] = DownloadJobResult(
                     raw_input=parsed.raw_input,
                     parsed_input=parsed,
@@ -885,6 +905,7 @@ def download_videos(options: DownloadOptions) -> list[tuple[ExtractionResult, Do
         ytdlp_cookies_file=options.ytdlp_cookies_file,
         ytdlp_remote_components=options.ytdlp_remote_components,
         force_redownload=options.force_redownload,
+        bilibili_download_mode=options.bilibili_download_mode,
     )
     failures = [item for item in job_results if not item.ok]
     if failures:
@@ -938,6 +959,7 @@ def download_jobs(options: DownloadOptions) -> list[DownloadJobResult]:
         ytdlp_cookies_file=options.ytdlp_cookies_file,
         ytdlp_remote_components=options.ytdlp_remote_components,
         force_redownload=options.force_redownload,
+        bilibili_download_mode=options.bilibili_download_mode,
     )
 
 
@@ -956,3 +978,118 @@ def doctor(options: DoctorOptions) -> list[DoctorCheck]:
         keep_open=options.keep_open,
         login_urls=options.login_urls,
     )
+
+
+def series_command(
+    raw_input: str,
+    season_id: int | None = None,
+    download: bool = False,
+    json_output: bool = False,
+    config=None,
+    output_dir_override: Path | None = None,
+    timeout_secs_override: int | None = None,
+    headless_override: bool | None = None,
+    profile_dir_override: Path | None = None,
+    browser_path_override: str | None = None,
+    bb_mode_override: str | None = None,
+) -> int:
+    from videocp.bilibili_series import extract_mid_from_url, fetch_all_archives, fetch_seasons_series_list
+
+    raw = str(raw_input or "").strip()
+    mid = int(raw) if raw.isdigit() else extract_mid_from_url(raw)
+    if not mid:
+        print("error: 请传入 B站空间链接或数字 mid")
+        return 1
+
+    profile_dir = profile_dir_override or (config.profile_dir if config else default_profile_dir())
+    browser_path = browser_path_override or (config.browser_path if config else detect_system_browser_executable())
+    headless = headless_override if headless_override is not None else (config.headless if config else True)
+    timeout_secs = timeout_secs_override or (config.timeout_secs if config else 30)
+    output_dir = output_dir_override or (config.output_dir if config else Path("./downloads").resolve())
+    bb_mode = bb_mode_override or (config.bilibili_download_mode if config else "tv")
+    browser_config = BrowserConfig(profile_dir=profile_dir, browser_path=browser_path, headless=headless)
+
+    if not browser_path:
+        print("error: No Chrome-family browser found. Use --browser-path.")
+        return 1
+
+    with open_download_browser_session(browser_config) as browser:
+        page = browser.new_page()
+        try:
+            series_list = fetch_seasons_series_list(page, mid=mid, timeout_secs=timeout_secs)
+            if season_id is not None:
+                series_list = [item for item in series_list if item.season_id == season_id]
+            payload = []
+            for item in series_list:
+                videos = fetch_all_archives(page, mid=mid, season_id=item.season_id, timeout_secs=timeout_secs)
+                payload.append({"series": item, "videos": videos})
+        finally:
+            page.close()
+
+    if not download:
+        if json_output:
+            print(json.dumps([
+                {
+                    "season_id": item["series"].season_id,
+                    "name": item["series"].meta_name,
+                    "total": item["series"].total,
+                    "videos": [
+                        {
+                            "bvid": video.bvid,
+                            "title": video.title,
+                            "url": video.video_url,
+                            "duration_secs": video.duration_secs,
+                        }
+                        for video in item["videos"]
+                    ],
+                }
+                for item in payload
+            ], ensure_ascii=False, indent=2))
+        else:
+            for item in payload:
+                info = item["series"]
+                print(f"[{info.season_id}] {info.meta_name} ({len(item['videos'])}/{info.total})")
+                for video in item["videos"]:
+                    print(f"  - {video.bvid} {video.title}")
+        return 0
+
+    prepared_inputs: list[ParsedInput] = []
+    for item in payload:
+        author_hint = item["series"].meta_name
+        for video in item["videos"]:
+            prepared_inputs.append(ParsedInput(
+                raw_input=video.video_url,
+                extracted_url=video.video_url,
+                canonical_url=video.video_url,
+                provider_key="bilibili",
+                author_hint=author_hint,
+            ))
+    results = _run_download_jobs(
+        prepared_inputs=dedupe_prepared_inputs(prepared_inputs),
+        browser_config=browser_config,
+        output_dir=output_dir,
+        timeout_secs=timeout_secs,
+        max_concurrent=(config.max_concurrent if config else 1),
+        max_concurrent_per_site=(config.max_concurrent_per_site if config else 1),
+        start_interval_secs=(config.start_interval_secs if config else 0.0),
+        watermark=(config.watermark if config else None),
+        bilibili_download_mode=bb_mode,
+    )
+    if json_output:
+        print(json.dumps([
+            {
+                "ok": item.ok,
+                "url": item.raw_input,
+                "path": str(item.artifact.output_path) if item.artifact else "",
+                "content_id": item.extraction.metadata.content_id if item.extraction else "",
+                "error": item.error,
+            }
+            for item in results
+        ], ensure_ascii=False, indent=2))
+    else:
+        for item in results:
+            if item.ok:
+                print(f"Downloaded {item.extraction.metadata.content_id}: {item.artifact.output_path}")
+            else:
+                print(f"Failed {item.raw_input}: {item.error}")
+    return 0 if all(item.ok for item in results) else 1

@@ -112,6 +112,7 @@ def _workflow_app_config(base_dir: Path, download_dir: Path) -> AppConfig:
         start_interval_secs=loaded.start_interval_secs,
         watermark=loaded.watermark if loaded.watermark else WatermarkConfig(),
         profile_videos_count=loaded.profile_videos_count,
+        bilibili_download_mode=loaded.bilibili_download_mode,
         source_path=loaded.source_path,
     )
 
@@ -149,6 +150,9 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
 
     output_dir = resolve_config_path(output_dir_raw, base_dir)
     app_cfg = _workflow_app_config(base_dir, output_dir)
+    bilibili_download_mode = str(download_raw.get("bilibili_download_mode") or app_cfg.bilibili_download_mode or "tv").strip().lower()
+    if bilibili_download_mode not in {"tv", "web", "ytdlp"}:
+        bilibili_download_mode = "tv"
     history = load_history(history_file)
     publish_history_file = resolve_config_path(
         (app_config.get("publish") or {}).get("history_file", "./publish_history_mac.json"),
@@ -182,6 +186,7 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
             watermark=app_cfg.watermark,
             profile_videos_count=count,
             profile_order=order,
+            bilibili_download_mode=bilibili_download_mode,
             ytdlp_extractor_args=ytdlp_extractor_args,
             ytdlp_cookies_file=ytdlp_cookies_file,
             ytdlp_remote_components=ytdlp_remote_components,

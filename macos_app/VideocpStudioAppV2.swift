@@ -61,6 +61,7 @@ struct DownloadSettings: Codable {
     var history_file: String = "./download_history_mac.json"
     var order: String = "latest"
     var count: Int = 3
+    var bilibili_download_mode: String = "tv"
     var youtube_auto_token: Bool = false
     var youtube_cookies_text: String = ""
     var youtube_cookies_path: String = ""
@@ -68,7 +69,7 @@ struct DownloadSettings: Codable {
     var ytdlp_remote_components: Bool = true
 
     enum CodingKeys: String, CodingKey {
-        case single_video_url, profile_url_draft, profiles, inputs_text, output_dir, history_file, order, count, youtube_auto_token, youtube_cookies_text, youtube_cookies_path, ytdlp_extractor_args, ytdlp_remote_components
+        case single_video_url, profile_url_draft, profiles, inputs_text, output_dir, history_file, order, count, bilibili_download_mode, youtube_auto_token, youtube_cookies_text, youtube_cookies_path, ytdlp_extractor_args, ytdlp_remote_components
     }
 
     init() {}
@@ -83,6 +84,7 @@ struct DownloadSettings: Codable {
         history_file = try c.decodeIfPresent(String.self, forKey: .history_file) ?? history_file
         order = try c.decodeIfPresent(String.self, forKey: .order) ?? order
         count = try c.decodeIfPresent(Int.self, forKey: .count) ?? count
+        bilibili_download_mode = try c.decodeIfPresent(String.self, forKey: .bilibili_download_mode) ?? bilibili_download_mode
         youtube_auto_token = try c.decodeIfPresent(Bool.self, forKey: .youtube_auto_token) ?? youtube_auto_token
         youtube_cookies_text = try c.decodeIfPresent(String.self, forKey: .youtube_cookies_text) ?? youtube_cookies_text
         youtube_cookies_path = try c.decodeIfPresent(String.self, forKey: .youtube_cookies_path) ?? youtube_cookies_path
@@ -452,6 +454,8 @@ final class AppModel: ObservableObject {
 
     let appRoot: URL
     let configURL: URL
+    let logDirectoryURL: URL
+    let logFileURL: URL
     private var schedulerProcess: Process?
     private var schedulerTimer: Timer?
     private var activeGenericProcess: Process?
@@ -466,7 +470,7 @@ final class AppModel: ObservableObject {
     private var publishProcessOutputs: [String: String] = [:]
     private var suppressNextTencentFailureNotice = false
     private var logLines: [String] = []
-    private let maxVisibleLogLines = 800
+    private let maxVisibleLogLines = 100
     private let maxVisibleLogLineLength = 1200
 
     var hasActiveProfileDownloads: Bool {
@@ -484,6 +488,9 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("Library/Application Support/Videocp Studio")
         try? FileManager.default.createDirectory(at: supportRoot, withIntermediateDirectories: true)
         self.configURL = supportRoot.appendingPathComponent("mac-app.json")
+        self.logDirectoryURL = supportRoot.appendingPathComponent("logs")
+        self.logFileURL = logDirectoryURL.appendingPathComponent("app.log")
+        try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
         let legacyConfigURL = appRoot.appendingPathComponent("mac-app.json")
         if !FileManager.default.fileExists(atPath: configURL.path),
            FileManager.default.fileExists(atPath: legacyConfigURL.path) {
@@ -1632,6 +1639,7 @@ final class AppModel: ObservableObject {
                     : value
             }
         guard !newLines.isEmpty else { return }
+        appendFullLogLines(newLines)
         logLines.append(contentsOf: newLines)
         if logLines.count > maxVisibleLogLines {
             let overflow = logLines.count - maxVisibleLogLines
@@ -1642,11 +1650,30 @@ final class AppModel: ObservableObject {
         logs = logLines.joined(separator: "\n")
     }
 
+    private func appendFullLogLines(_ lines: [String]) {
+        let formatter = ISO8601DateFormatter()
+        let text = lines.map { "[\(formatter.string(from: Date()))] \($0)" }.joined(separator: "\n") + "\n"
+        guard let data = text.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: logFileURL.path),
+           let handle = try? FileHandle(forWritingTo: logFileURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: logFileURL, options: .atomic)
+        }
+    }
+
     func clearLogs() {
         logLines.removeAll()
         logs = ""
         logLineCount = 0
         droppedLogLineCount = 0
+    }
+
+    func openLogDirectory() {
+        try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(logDirectoryURL)
     }
 
     private func friendlyFailure(from output: String) -> String {
@@ -1852,6 +1879,7 @@ struct ContentView: View {
     @State private var schedulePublishDeleteAfterDraft = true
     @State private var editingDownloadTask: ScheduledDownloadTask?
     @State private var editingPublishTask: ScheduledPublishTask?
+    @State private var editingProfileNameID: String?
     @State private var publishHistoryPage = 0
     @State private var publishHistoryFilter = "all"
 
@@ -1900,7 +1928,7 @@ struct ContentView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Color.accentColor)
             }
-            Text("v1.0.5")
+            Text("v1.0.6")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 8)
@@ -2120,11 +2148,8 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 150)
             } else {
-                profileTaskHeader
-                Divider()
                 ForEach($model.config.download.profiles) { $profile in
                     profileTaskRow(profile: $profile)
-                    Divider()
                 }
             }
         }
@@ -2164,14 +2189,15 @@ struct ContentView: View {
 
     private var profileTaskHeader: some View {
         HStack(spacing: 12) {
-            Text("备注 / 主页").frame(maxWidth: .infinity, alignment: .leading)
+            Text("备注").frame(minWidth: 260, maxWidth: .infinity, alignment: .leading)
+            Text("链接").frame(width: 72, alignment: .leading)
             Text("平台").frame(width: 82, alignment: .leading)
             Text("本地已有").frame(width: 72, alignment: .leading)
             Text("下载方式").frame(width: 92, alignment: .leading)
             Text("数量").frame(width: 58, alignment: .leading)
             Text("进度").frame(width: 170, alignment: .leading)
-            Text("定时").frame(width: 150, alignment: .leading)
-            Text("操作").frame(width: 94, alignment: .leading)
+            Text("定时").frame(width: 190, alignment: .leading)
+            Text("操作").frame(width: 112, alignment: .leading)
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -2183,118 +2209,136 @@ struct ContentView: View {
         let current = profile.wrappedValue
         let progress = model.profileProgress[current.id] ?? DownloadTaskProgress()
         let scheduleTask = model.config.automation.download_tasks.first { $0.profile_id == current.id }
-        return HStack(spacing: 12) {
-            HStack(spacing: 9) {
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
                 Image(systemName: "person.crop.rectangle.stack")
                     .foregroundStyle(Color.accentColor)
-                VStack(alignment: .leading, spacing: 3) {
+                if editingProfileNameID == current.id {
                     TextField("备注", text: profile.name)
                         .font(.headline)
-                        .textFieldStyle(.plain)
+                        .textFieldStyle(.roundedBorder)
                         .lineLimit(1)
                         .disabled(model.isProfileDownloading(current.id))
-                        .help("可编辑备注；默认使用解析到的 UP 主名称")
-                    Link(current.url, destination: URL(string: current.url) ?? URL(fileURLWithPath: "/"))
-                        .font(.caption)
+                    Button {
+                        editingProfileNameID = nil
+                        model.save()
+                    } label: {
+                        Label("完成", systemImage: "checkmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                } else {
+                    Text(current.name.isEmpty ? "未命名 UP 主" : current.name)
+                        .font(.headline)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                    Button {
+                        editingProfileNameID = current.id
+                    } label: {
+                        Label("编辑名称", systemImage: "pencil")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(model.isProfileDownloading(current.id))
                 }
+                Spacer()
+                Link("主页链接", destination: URL(string: current.url) ?? URL(fileURLWithPath: "/"))
+                    .font(.caption)
+                    .help(current.url)
+                statusPill(text: model.platformName(for: current.url), ok: true)
+                Text("本地 \(model.localVideoCount(for: current)) 个")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(model.platformName(for: current.url))
-                .font(.caption)
-                .frame(width: 82, alignment: .leading)
-
-            Text("\(model.localVideoCount(for: current)) 个")
-                .font(.caption)
-                .frame(width: 72, alignment: .leading)
-
-            Picker("", selection: profile.order) {
-                Text("最新").tag("latest")
-                Text("热度").tag("popular")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(width: 92, alignment: .leading)
-            .disabled(model.isProfileDownloading(current.id))
-
-            TextField("", value: profile.count, format: .number)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 52)
+            HStack(spacing: 12) {
+                Picker("下载方式", selection: profile.order) {
+                    Text("最新").tag("latest")
+                    Text("热度").tag("popular")
+                }
+                .pickerStyle(.menu)
+                .frame(width: 130, alignment: .leading)
                 .disabled(model.isProfileDownloading(current.id))
 
-            VStack(alignment: .leading, spacing: 4) {
-                ProgressView(value: progress.fraction)
-                HStack(spacing: 5) {
-                    Text(progress.status)
-                    if progress.total > 0 {
-                        Text("\(progress.completed)/\(progress.total)")
-                    }
-                    if progress.skippedDuplicates > 0 {
-                        Text("重复 \(progress.skippedDuplicates)")
-                    }
+                HStack(spacing: 6) {
+                    Text("数量")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("", value: profile.count, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 58)
+                        .disabled(model.isProfileDownloading(current.id))
                 }
-                .font(.caption2)
-                .foregroundStyle(progress.status == "下载失败" ? Color.red : Color.secondary)
-            }
-            .frame(width: 170)
 
-            HStack(spacing: 6) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: progress.fraction)
+                    HStack(spacing: 5) {
+                        Text(progress.status)
+                        if progress.total > 0 {
+                            Text("\(progress.completed)/\(progress.total)")
+                        }
+                        if progress.skippedDuplicates > 0 {
+                            Text("重复 \(progress.skippedDuplicates)")
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(progress.status == "下载失败" ? Color.red : Color.secondary)
+                }
+                .frame(maxWidth: .infinity)
+
                 if let scheduleTask {
+                    statusPill(
+                        text: model.scheduledDownloadStatus(for: scheduleTask),
+                        ok: scheduleTask.enabled && model.config.download.profiles.contains { $0.id == scheduleTask.profile_id }
+                    )
                     Button {
                         model.setScheduledDownloadTaskEnabled(scheduleTask, enabled: !scheduleTask.enabled)
                     } label: {
-                        Image(systemName: scheduleTask.enabled ? "pause.circle" : "play.circle")
+                        Label(scheduleTask.enabled ? "停止定时" : "开启定时", systemImage: scheduleTask.enabled ? "stop.circle" : "play.circle")
                     }
-                    .help(scheduleTask.enabled ? "停止定时下载" : "开启定时下载")
+                    .buttonStyle(.borderless)
                     Button {
                         editDownloadSchedule(scheduleTask, fallbackProfileID: current.id)
                     } label: {
-                        Image(systemName: "clock.badge.checkmark")
+                        Label("修改", systemImage: "pencil")
                     }
-                    .help("修改定时下载")
+                    .buttonStyle(.borderless)
                     Button(role: .destructive) {
                         model.deleteScheduledDownloadTask(scheduleTask)
                     } label: {
                         Image(systemName: "trash")
                     }
-                    .help("删除定时下载")
+                    .buttonStyle(.borderless)
                 } else {
                     Button {
                         editDownloadSchedule(nil, fallbackProfileID: current.id)
                     } label: {
-                        Label("定时", systemImage: "clock.badge.plus")
+                        Label("设置定时", systemImage: "clock.badge.plus")
                     }
-                    .font(.caption)
-                    .help("为这个 UP 主设置定时下载")
+                    .buttonStyle(.borderless)
                 }
-            }
-            .buttonStyle(.borderless)
-            .frame(width: 150, alignment: .leading)
 
-            HStack(spacing: 6) {
+                Divider().frame(height: 22)
+
                 if model.isProfileDownloading(current.id) {
                     Button { model.stopProfileDownload(current) } label: {
-                        Image(systemName: "stop.circle.fill")
+                        Label("停止", systemImage: "stop.circle.fill")
                     }
-                    .help("停止这个主页下载")
                 } else {
                     Button { model.runProfileDownload(current) } label: {
-                        Image(systemName: "arrow.down.circle")
+                        Label("下载", systemImage: "arrow.down.circle")
                     }
-                    .help("下载这个主页的新视频")
                     .disabled(!model.downloadDirectoryReady)
                 }
                 Button(role: .destructive) { model.deleteProfile(current) } label: {
                     Image(systemName: "trash")
                 }
-                .help("删除主页任务")
+                .buttonStyle(.borderless)
                 .disabled(model.isProfileDownloading(current.id))
             }
-            .frame(width: 94, alignment: .leading)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 11)
+        .padding(12)
+        .background(Color(NSColor.windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, 5)
     }
 
     private func editDownloadSchedule(_ task: ScheduledDownloadTask?, fallbackProfileID: String) {
@@ -2657,13 +2701,17 @@ struct ContentView: View {
             titleRow(editingDownloadTask == nil ? "设置 UP 主定时下载" : "修改 UP 主定时下载", icon: "arrow.down.circle.fill")
             VStack(alignment: .leading, spacing: 5) {
                 Text("UP 主").font(.caption).foregroundStyle(.secondary)
-                Picker("选择 UP 主", selection: $scheduleProfileDraft) {
-                    ForEach(model.config.download.profiles) { profile in
-                        Text(profile.name.isEmpty ? profile.url : profile.name).tag(profile.id)
-                    }
+                HStack {
+                    Image(systemName: "person.crop.rectangle.stack")
+                        .foregroundStyle(Color.accentColor)
+                    Text(model.config.download.profiles.first(where: { $0.id == scheduleProfileDraft }).map { $0.name.isEmpty ? $0.url : $0.name } ?? "当前 UP 主")
+                        .font(.headline)
+                        .lineLimit(1)
+                    Spacer()
                 }
-                .labelsHidden()
-                .frame(minWidth: 360)
+                .padding(10)
+                .background(Color(NSColor.controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
             }
             HStack(spacing: 12) {
                 intField("执行间隔（分钟）", value: $scheduleIntervalDraft)
@@ -2679,7 +2727,6 @@ struct ContentView: View {
                 }
                 Button(editingDownloadTask == nil ? "添加任务" : "保存修改") {
                     if var task = editingDownloadTask {
-                        task.profile_id = scheduleProfileDraft
                         task.interval_minutes = scheduleIntervalDraft
                         task.active_start = scheduleStartDraft
                         task.active_end = scheduleEndDraft
@@ -2810,6 +2857,11 @@ struct ContentView: View {
                 Text(model.droppedLogLineCount > 0 ? "最近 \(model.logLineCount) 行，已省略 \(model.droppedLogLineCount) 行" : "最近 \(model.logLineCount) 行")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Button {
+                    model.openLogDirectory()
+                } label: {
+                    Label("查看全部日志", systemImage: "folder")
+                }
                 Button {
                     model.clearLogs()
                 } label: {

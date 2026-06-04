@@ -38,6 +38,7 @@ DEFAULT_APP_CONFIG = {
         "history_file": "./download_history_mac.json",
         "order": "latest",
         "count": 3,
+        "bilibili_download_mode": "tv",
         "youtube_auto_token": False,
         "ytdlp_extractor_args": "",
     },

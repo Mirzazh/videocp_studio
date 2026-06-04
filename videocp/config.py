@@ -33,6 +33,7 @@ class AppConfig:
     start_interval_secs: float
     watermark: WatermarkConfig
     profile_videos_count: int = 3
+    bilibili_download_mode: str = "tv"
     source_path: Path | None = None
 
 
@@ -122,6 +123,9 @@ def load_app_config(config_path: Path | None = None, start_dir: Path | None = No
         profile_videos_count = int(download_config.get("profile_videos_count", 3) or 3)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid profile_videos_count in {CONFIG_FILENAME}") from exc
+    bilibili_download_mode = str(download_config.get("bilibili_download_mode", "tv") or "tv").strip().lower()
+    if bilibili_download_mode not in {"tv", "web", "ytdlp"}:
+        bilibili_download_mode = "tv"
     profile_dir_value = browser_config.get("profile_dir", str(default_profile_dir()))
     browser_path = str(browser_config.get("browser_path", "") or "").strip()
     headless = _as_bool(browser_config.get("headless", False), False)
@@ -151,6 +155,7 @@ def load_app_config(config_path: Path | None = None, start_dir: Path | None = No
         start_interval_secs=max(0.0, start_interval_secs),
         watermark=watermark,
         profile_videos_count=max(1, profile_videos_count),
+        bilibili_download_mode=bilibili_download_mode,
         source_path=resolved_path,
     )
 

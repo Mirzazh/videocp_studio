@@ -4,6 +4,7 @@ download:
   max_concurrent_per_site: 1
   start_interval_secs: 0
   profile_videos_count: 3
+  bilibili_download_mode: tv
 
 browser:
   profile_dir: ~/Library/Caches/videocp/chrome-profile

@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--timeout-secs", type=int, default=None, help="Timeout in seconds.")
     download_parser.add_argument("--profile-videos-count", type=int, default=None, help="Number of recent videos to download from a profile page.")
     download_parser.add_argument("--profile-order", choices=["latest", "popular"], default="latest", help="Profile page ordering.")
+    download_parser.add_argument(
+        "--bb-mode",
+        dest="bilibili_download_mode",
+        choices=["tv", "web", "ytdlp"],
+        default=None,
+        help="Bilibili download strategy: tv (stable), web (higher quality with Bilibili login), or ytdlp (fallback).",
+    )
     download_parser.add_argument("--ytdlp-extractor-args", default="", help="Extra yt-dlp --extractor-args value.")
 
     prepare_parser = subparsers.add_parser("prepare-list", help="Resolve inputs and write a canonical URL list.")
@@ -89,6 +96,27 @@ def build_parser() -> argparse.ArgumentParser:
     sync_headless.add_argument("--no-headless", dest="headless", action="store_false", help="Run Chrome with a visible window.")
     sync_parser.set_defaults(headless=None)
 
+    series_parser = subparsers.add_parser("series", help="List or download videos from a Bilibili series/collection.")
+    series_parser.add_argument("input", help="Bilibili user space URL or numeric mid.")
+    series_parser.add_argument("--season-id", type=int, default=None, help="Only show/download videos from this specific series.")
+    series_parser.add_argument("--download", action="store_true", help="Download all videos from the series.")
+    series_parser.add_argument("--json", action="store_true", help="Print result as JSON.")
+    series_parser.add_argument("--output-dir", default=None, help="Output directory for downloads.")
+    series_parser.add_argument("--timeout-secs", type=int, default=None, help="Timeout in seconds.")
+    series_parser.add_argument("--profile-dir", default=None, help="Dedicated Chrome profile directory.")
+    series_parser.add_argument("--browser-path", default=None, help="Chrome executable path.")
+    series_headless = series_parser.add_mutually_exclusive_group()
+    series_headless.add_argument("--headless", dest="headless", action="store_true", help="Run Chrome headless.")
+    series_headless.add_argument("--no-headless", dest="headless", action="store_false", help="Run Chrome with a visible window.")
+    series_parser.set_defaults(headless=None)
+    series_parser.add_argument(
+        "--bb-mode",
+        dest="bilibili_download_mode",
+        choices=["tv", "web", "ytdlp"],
+        default=None,
+        help="Bilibili download strategy: tv, web, or ytdlp.",
+    )
+
     app_parser = subparsers.add_parser("mac-app", help="Open the macOS scheduler app.")
     app_parser.add_argument("--app-config", default=None, help="Path to mac-app.json.")
 
@@ -127,6 +155,7 @@ def resolve_cli_path(value: str | None) -> Path | None:
 
 def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
     cli_profile_videos_count = getattr(args, "profile_videos_count", None)
+    cli_bb_mode = getattr(args, "bilibili_download_mode", None)
     return AppConfig(
         output_dir=resolve_cli_path(getattr(args, "output_dir", None)) or config.output_dir,
         profile_dir=resolve_cli_path(getattr(args, "profile_dir", None)) or config.profile_dir,
@@ -138,6 +167,7 @@ def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfi
         start_interval_secs=config.start_interval_secs,
         watermark=config.watermark,
         profile_videos_count=(cli_profile_videos_count if cli_profile_videos_count is not None else config.profile_videos_count),
+        bilibili_download_mode=(cli_bb_mode if cli_bb_mode is not None else config.bilibili_download_mode),
         source_path=config.source_path,
     )
 
@@ -167,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                     watermark=config.watermark,
                     profile_videos_count=config.profile_videos_count,
                     profile_order=args.profile_order,
+                    bilibili_download_mode=config.bilibili_download_mode,
                     ytdlp_extractor_args=args.ytdlp_extractor_args,
                 )
             )
@@ -277,6 +308,23 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         print(f"[failed] {r.task_name}: {r.error}")
             return 0 if all(r.ok for r in results) else 1
+
+        if args.command == "series":
+            from videocp.app import series_command
+
+            return series_command(
+                raw_input=args.input,
+                season_id=args.season_id,
+                download=args.download,
+                json_output=args.json,
+                config=config,
+                output_dir_override=resolve_cli_path(args.output_dir),
+                timeout_secs_override=args.timeout_secs,
+                headless_override=args.headless,
+                profile_dir_override=resolve_cli_path(args.profile_dir),
+                browser_path_override=args.browser_path,
+                bb_mode_override=args.bilibili_download_mode,
+            )
 
         if args.command == "mac-app":
             from videocp.mac_web_app import main as app_main
