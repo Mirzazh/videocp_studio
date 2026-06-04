@@ -451,6 +451,7 @@ final class AppModel: ObservableObject {
     @Published var noticeText: String = ""
     @Published var noticeIsError = false
     @Published var publishHistory: [PublishHistoryEntry] = []
+    @Published var youtubeCookieStatusText: String = ""
 
     let appRoot: URL
     let configURL: URL
@@ -625,6 +626,19 @@ final class AppModel: ObservableObject {
             config.download.youtube_cookies_path = path
             save()
         }
+    }
+
+    func saveYouTubeCookies() {
+        let text = config.download.youtube_cookies_text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            youtubeCookieStatusText = "请先粘贴 cookies.txt 内容"
+            reportIssue("请先粘贴 YouTube cookies.txt 内容")
+            return
+        }
+        config.download.youtube_cookies_path = ""
+        save()
+        youtubeCookieStatusText = "Cookie 已保存并将在下次下载生效"
+        reportInfo("YouTube Cookie 已保存生效")
     }
 
     func choosePublishDirectory() {
@@ -1120,6 +1134,18 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func retryFailedPublishes(_ entries: [PublishHistoryEntry]) {
+        let candidates = entries.filter { canRetryPublish($0) && !isRetryPublishRunning($0) }
+        guard !candidates.isEmpty else {
+            reportIssue("没有可重新发布的失败视频")
+            return
+        }
+        for entry in candidates {
+            retryPublish(entry)
+        }
+        reportInfo("已开始重新发布 \(candidates.count) 条失败视频")
+    }
+
     func canRetryPublish(_ entry: PublishHistoryEntry) -> Bool {
         guard !entry.isPublishSuccess else { return false }
         let path = (entry.output_path as NSString).expandingTildeInPath
@@ -1321,7 +1347,7 @@ final class AppModel: ObservableObject {
             let name = response.nickname.isEmpty ? (response.global_nickname.isEmpty ? "当前账号" : response.global_nickname) : response.nickname
             let author = response.is_guild_author ? "创作者" : "非创作者"
             let source = response.token_source.isEmpty ? "未知来源" : response.token_source
-            tencentStatusText = "验证成功：\(name) · \(author) · \(source)"
+            tencentStatusText = "\(name) · \(author)"
             tencentNickname = name
             reportInfo("腾讯频道验证成功，\(greetingText)")
             appendLog("腾讯频道验证成功: \(name), \(author), 来源 \(source)")
@@ -1923,6 +1949,8 @@ struct ContentView: View {
     @State private var editingProfileNameID: String?
     @State private var publishHistoryPage = 0
     @State private var publishHistoryFilter = "all"
+    @State private var publishHistoryJumpText = ""
+    @State private var showTencentTokenSettings = false
     @State private var showLogSearch = false
     @State private var logSearchText = ""
     @State private var logSearchKeyMonitor: Any?
@@ -1977,7 +2005,7 @@ struct ContentView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Color.accentColor)
             }
-            Text("v1.0.7")
+            Text("v1.0.8")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 8)
@@ -2088,6 +2116,38 @@ struct ContentView: View {
             .count
     }
 
+    private func visiblePageItems(pageCount: Int, currentPage: Int) -> [Int?] {
+        guard pageCount > 1 else { return [0] }
+        var pages = Set<Int>()
+        pages.insert(0)
+        pages.insert(pageCount - 1)
+        for page in max(0, currentPage - 2)...min(pageCount - 1, currentPage + 2) {
+            pages.insert(page)
+        }
+        if currentPage < 4 {
+            for page in 0...min(pageCount - 1, 4) { pages.insert(page) }
+        }
+        if currentPage > pageCount - 5 {
+            for page in max(0, pageCount - 5)..<pageCount { pages.insert(page) }
+        }
+        let sorted = pages.sorted()
+        var result: [Int?] = []
+        var previous: Int?
+        for page in sorted {
+            if let previous, page - previous > 1 {
+                result.append(nil)
+            }
+            result.append(page)
+            previous = page
+        }
+        return result
+    }
+
+    private func jumpPublishHistory(to text: String, pageCount: Int) {
+        guard let page = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
+        publishHistoryPage = min(max(page - 1, 0), max(pageCount - 1, 0))
+    }
+
     private var downloadView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -2155,16 +2215,20 @@ struct ContentView: View {
                                 .font(.system(.caption, design: .monospaced))
                                 .frame(minHeight: 150)
                                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.16)))
-                            HStack(spacing: 12) {
-                                field("或选择 cookies.txt 文件", text: $model.config.download.youtube_cookies_path)
-                                Button { model.chooseYouTubeCookieFile() } label: {
-                                    Label("选择", systemImage: "doc.text")
+                            HStack(spacing: 10) {
+                                Button { model.saveYouTubeCookies() } label: {
+                                    Label("保存 Cookie", systemImage: "checkmark.circle")
                                 }
+                                .buttonStyle(.borderedProminent)
+                                if !model.youtubeCookieStatusText.isEmpty {
+                                    statusPill(text: model.youtubeCookieStatusText, ok: model.config.download.youtube_cookies_text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                                }
+                                Spacer()
+                                Button { model.checkYouTubeHelper() } label: {
+                                    Label("检查下载组件", systemImage: "checkmark.seal")
+                                }
+                                .disabled(model.busy)
                             }
-                            Button { model.checkYouTubeHelper() } label: {
-                                Label("检查 YouTube 下载组件", systemImage: "checkmark.seal")
-                            }
-                            .disabled(model.busy)
                         }
                         .padding(.top, 10)
                     } label: {
@@ -2179,14 +2243,14 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("添加 UP 主").font(.title2.bold())
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("主页 URL")
+                    Text("主页 URL（YouTube / B站 / 抖音等）")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     TextEditor(text: $model.config.download.profile_url_draft)
                         .font(.system(.body, design: .monospaced))
                         .frame(minHeight: 150)
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.16)))
-                    Text("支持批量导入，一行一个主页链接。重复链接会自动忽略。")
+                    Text("支持批量导入，一行一个主页链接。抖音主页和抖音单视频链接也可以直接使用。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -2456,31 +2520,67 @@ struct ContentView: View {
                 titleRow("发布到频道", icon: "paperplane.circle.fill")
                 publishTabs
                 panel {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("频道账号", systemImage: "person.crop.circle.badge.checkmark")
-                            .font(.headline)
-                        HStack(spacing: 5) {
-                            Text("还没有 Token？")
-                                .foregroundStyle(.secondary)
-                            Link("前往腾讯频道开放平台获取", destination: URL(string: "https://connect.qq.com/")!)
-                        }
-                        .font(.caption)
-                        SecureField("粘贴 QQ_AI_CONNECT_TOKEN，用于保存或更新本机登录凭证", text: $model.tencentTokenInput)
-                            .textFieldStyle(.roundedBorder)
+                    if model.tencentStatusOK && !showTencentTokenSettings {
                         HStack(spacing: 10) {
-                            Button { model.setupTencentChannel() } label: {
-                                Label("保存 / 更新 Token", systemImage: "key")
+                            Label(model.tencentStatusText, systemImage: "person.crop.circle.badge.checkmark")
+                                .font(.headline)
+                                .foregroundStyle(Color.green)
+                            Spacer()
+                            Button {
+                                showTencentTokenSettings = true
+                            } label: {
+                                Label("修改 Token", systemImage: "key")
                             }
-                            Button { model.checkTencentChannel() } label: {
-                                Label("检查登录", systemImage: "checkmark.seal")
+                            Button {
+                                model.checkTencentChannel()
+                            } label: {
+                                Label("重新检查", systemImage: "checkmark.seal")
                             }
                             .disabled(model.busy)
-                            statusPill(text: model.tencentStatusText, ok: model.tencentStatusOK)
-                            Spacer()
                         }
-                        Text("保存 / 更新 Token 会把你粘贴的 Token 写入本机 CLI 凭证；检查登录只验证当前凭证是否可用。")
+                    } else {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Label("频道账号", systemImage: "person.crop.circle.badge.checkmark")
+                                    .font(.headline)
+                                Spacer()
+                                if model.tencentStatusOK {
+                                    Button {
+                                        showTencentTokenSettings = false
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                            }
+                            HStack(spacing: 5) {
+                                Text("还没有 Token？")
+                                    .foregroundStyle(.secondary)
+                                Link("前往腾讯频道开放平台获取", destination: URL(string: "https://connect.qq.com/")!)
+                            }
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            SecureField("粘贴 QQ_AI_CONNECT_TOKEN，用于保存或更新本机登录凭证", text: $model.tencentTokenInput)
+                                .textFieldStyle(.roundedBorder)
+                            HStack(spacing: 10) {
+                                Button {
+                                    model.setupTencentChannel()
+                                    if !model.tencentTokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        showTencentTokenSettings = false
+                                    }
+                                } label: {
+                                    Label("保存 / 更新 Token", systemImage: "key")
+                                }
+                                Button { model.checkTencentChannel() } label: {
+                                    Label("检查登录", systemImage: "checkmark.seal")
+                                }
+                                .disabled(model.busy)
+                                statusPill(text: model.tencentStatusText, ok: model.tencentStatusOK)
+                                Spacer()
+                            }
+                            Text("保存 / 更新 Token 会把你粘贴的 Token 写入本机凭证；检查登录只验证当前凭证是否可用。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 if model.tencentStatusOK || publishMode == .history {
@@ -2606,6 +2706,7 @@ struct ContentView: View {
         let start = min(safePage * pageSize, filtered.count)
         let end = min(start + pageSize, filtered.count)
         let pageEntries = Array(filtered[start..<end])
+        let retryableFailed = filtered.filter { !($0.isPublishSuccess) && model.canRetryPublish($0) && !model.isRetryPublishRunning($0) }
         return panel {
             HStack {
                 Label("发布记录", systemImage: "clock.arrow.circlepath")
@@ -2628,6 +2729,12 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("刷新发布记录")
+                Button {
+                    model.retryFailedPublishes(retryableFailed)
+                } label: {
+                    Label("重新发布失败项", systemImage: "arrow.clockwise.circle")
+                }
+                .disabled(retryableFailed.isEmpty)
             }
             if filtered.isEmpty {
                 Text(publishHistoryFilter == "failed" ? "还没有失败记录" : "还没有发布记录")
@@ -2665,7 +2772,7 @@ struct ContentView: View {
                     .padding(.vertical, 2)
                 }
                 Divider()
-                HStack {
+                HStack(spacing: 8) {
                     Text("第 \(safePage + 1) / \(pageCount) 页")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -2674,10 +2781,49 @@ struct ContentView: View {
                         Image(systemName: "chevron.left")
                     }
                     .disabled(safePage == 0)
+                    ForEach(Array(visiblePageItems(pageCount: pageCount, currentPage: safePage).enumerated()), id: \.offset) { _, item in
+                        if let page = item {
+                            if page == safePage {
+                                Button {
+                                    publishHistoryPage = page
+                                } label: {
+                                    Text("\(page + 1)")
+                                        .font(.caption.monospacedDigit())
+                                        .frame(minWidth: 24)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            } else {
+                                Button {
+                                    publishHistoryPage = page
+                                } label: {
+                                    Text("\(page + 1)")
+                                        .font(.caption.monospacedDigit())
+                                        .frame(minWidth: 24)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        } else {
+                            Text("...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                     Button { publishHistoryPage = min(pageCount - 1, safePage + 1) } label: {
                         Image(systemName: "chevron.right")
                     }
                     .disabled(safePage >= pageCount - 1)
+                    TextField("页码", text: $publishHistoryJumpText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 56)
+                        .onSubmit {
+                            jumpPublishHistory(to: publishHistoryJumpText, pageCount: pageCount)
+                        }
+                    Button("跳转") {
+                        jumpPublishHistory(to: publishHistoryJumpText, pageCount: pageCount)
+                    }
+                    .disabled(publishHistoryJumpText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }

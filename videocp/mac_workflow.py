@@ -246,7 +246,9 @@ def parse_profile_from_app_config(app_config_path: Path, profile_url: str) -> di
             remote_components=ytdlp_remote_components,
         )
     except Exception as exc:
-        if "space.bilibili.com" not in urlparse(url).netloc.lower():
+        netloc = urlparse(url).netloc.lower()
+        browser_fallback_hosts = ("space.bilibili.com", "douyin.com")
+        if not any(host in netloc for host in browser_fallback_hosts):
             return ProfileParseResult(ok=False, url=url, error=str(exc)).to_dict()
         app_cfg = _workflow_app_config(base_dir, resolve_config_path(download_raw.get("output_dir", "./downloads"), base_dir))
         browser_path = app_cfg.browser_path or detect_system_browser_executable()

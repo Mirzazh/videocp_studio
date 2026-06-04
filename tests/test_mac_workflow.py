@@ -297,6 +297,35 @@ def test_parse_bilibili_profile_falls_back_to_browser_expansion(tmp_path: Path, 
     assert result["first_video_url"] == "https://www.bilibili.com/video/BV1fallback"
 
 
+def test_parse_douyin_profile_falls_back_to_browser_expansion(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def new_page(self):
+            return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr("videocp.mac_workflow.expand_ytdlp_playlist", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("unsupported")))
+    monkeypatch.setattr("videocp.mac_workflow.detect_system_browser_executable", lambda: "/Applications/Google Chrome.app")
+    monkeypatch.setattr("videocp.mac_workflow.open_download_browser_session", lambda *_: FakeBrowser())
+    monkeypatch.setattr(
+        "videocp.mac_workflow.expand_profile",
+        lambda **kwargs: SimpleNamespace(video_urls=["https://www.douyin.com/video/123456"], author="抖音作者"),
+    )
+
+    result = parse_profile_from_app_config(config_path, "https://www.douyin.com/user/MS4wLjABAAAA-demo")
+
+    assert result["ok"] is True
+    assert result["name"] == "抖音作者"
+    assert result["first_video_url"] == "https://www.douyin.com/video/123456"
+
+
 def test_publish_from_directory_uses_sidecar_title_records_and_deletes(tmp_path: Path, monkeypatch):
     video = tmp_path / "downloads" / "demo.mp4"
     video.parent.mkdir()
