@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
+from urllib.parse import urlencode, urljoin
 
 from playwright.sync_api import Page, Response
 
+from videocp.errors import DownloadError
 from videocp.providers import DOUYIN_USER_PROFILE_RE, SiteProvider, resolve_provider
 from videocp.runtime_log import full_url, log_info, log_warn
 
@@ -334,17 +337,17 @@ def _expand_bilibili_profile(
     return ProfileExpandResult(video_urls=video_urls, pinned_urls=[], author=author)
 
 
-def _extract_xhs_video_note_ids_from_dom(page: Page) -> list[str]:
-    """Extract video note IDs from XHS profile DOM.
+def _extract_xhs_video_urls_from_dom(page: Page) -> list[str]:
+    """Extract complete video note URLs from XHS profile DOM.
 
     Each note card is a <section class="note-item"> containing:
-    - A hidden <a href="/explore/{noteId}"> link
+    - A hidden <a href="/explore/{noteId}?xsec_token=..."> link
     - A <span class="play-icon"> if the note is a video
-    Returns note IDs for video notes only, in DOM order.
+    The access token in the link is required by current Xiaohongshu pages.
     """
     result = page.evaluate("""() => {
         var items = document.querySelectorAll("section.note-item");
-        var ids = [];
+        var urls = [];
         for (var i = 0; i < items.length; i++) {
             var el = items[i];
             if (!el.querySelector(".play-icon")) continue;
@@ -352,14 +355,106 @@ def _extract_xhs_video_note_ids_from_dom(page: Page) -> list[str]:
             for (var j = 0; j < links.length; j++) {
                 var href = links[j].getAttribute("href") || "";
                 var m = href.match(/\\/explore\\/([A-Za-z0-9]+)/);
-                if (m && m[1]) { ids.push(m[1]); break; }
+                if (m && m[1]) {
+                    urls.push(new URL(href, window.location.origin).href);
+                    break;
+                }
             }
         }
-        return ids;
+        return urls;
     }""")
     if not isinstance(result, list):
         return []
-    return [nid for nid in result if isinstance(nid, str) and nid]
+    return [url for url in result if isinstance(url, str) and "/explore/" in url]
+
+
+def _extract_xhs_video_note_ids_from_dom(page: Page) -> list[str]:
+    """Backward-compatible helper returning IDs from complete DOM URLs."""
+    note_ids: list[str] = []
+    for url in _extract_xhs_video_urls_from_dom(page):
+        match = XHS_NOTE_LINK_RE.search(url)
+        if match:
+            note_ids.append(match.group(1))
+    return note_ids
+
+
+def _xhs_login_prompt_visible(page: Page) -> bool:
+    try:
+        return bool(page.evaluate("""() => {
+            const selectors = [
+                "input[type='password']",
+                "input[placeholder*='手机号']",
+                "input[placeholder*='手机号码']",
+                ".login-container",
+                ".login-modal",
+                "[class*='login-modal']",
+                "[class*='login-container']"
+            ];
+            if (selectors.some(selector => document.querySelector(selector))) return true;
+            const text = (document.body && document.body.innerText || "").replace(/\\s+/g, "");
+            return [
+                "登录后查看",
+                "登录即可查看",
+                "手机号登录",
+                "扫码登录",
+                "密码登录"
+            ].some(value => text.includes(value));
+        }"""))
+    except Exception:
+        return False
+
+
+def _show_xhs_login_banner(page: Page, message: str, success: bool = False) -> None:
+    try:
+        page.evaluate(
+            """({message, success}) => {
+                let banner = document.getElementById("videocp-xhs-login-banner");
+                if (!banner) {
+                    banner = document.createElement("div");
+                    banner.id = "videocp-xhs-login-banner";
+                    banner.style.cssText = [
+                        "position:fixed",
+                        "top:16px",
+                        "left:50%",
+                        "transform:translateX(-50%)",
+                        "z-index:2147483647",
+                        "padding:10px 16px",
+                        "border-radius:8px",
+                        "color:white",
+                        "font:600 14px -apple-system,BlinkMacSystemFont,sans-serif",
+                        "box-shadow:0 6px 24px rgba(0,0,0,.24)",
+                        "pointer-events:none"
+                    ].join(";");
+                    document.documentElement.appendChild(banner);
+                }
+                banner.style.background = success ? "#1f9d61" : "#ff2442";
+                banner.textContent = message;
+            }""",
+            {"message": message, "success": success},
+        )
+    except Exception:
+        pass
+
+
+def _wait_for_xhs_login(page: Page, timeout_secs: int = 180) -> bool:
+    deadline = time.monotonic() + max(30, timeout_secs)
+    next_log_at = time.monotonic()
+    _show_xhs_login_banner(page, "请完成小红书登录，登录成功后 App 会自动继续")
+    log_info("profile.expand.login_wait", site="xiaohongshu", timeout_secs=max(30, timeout_secs))
+    while time.monotonic() < deadline:
+        if _extract_xhs_video_urls_from_dom(page):
+            _show_xhs_login_banner(page, "登录成功，正在读取主页视频", success=True)
+            page.wait_for_timeout(1500)
+            log_info("profile.expand.login_complete", site="xiaohongshu")
+            return True
+        now = time.monotonic()
+        if now >= next_log_at:
+            remaining = max(0, int(deadline - now))
+            log_info("profile.expand.login_waiting", site="xiaohongshu", remaining_secs=remaining)
+            next_log_at = now + 15
+        page.wait_for_timeout(1000)
+    log_warn("profile.expand.login_timeout", site="xiaohongshu", timeout_secs=max(30, timeout_secs))
+    return False
 
 
 def _expand_xiaohongshu_profile(
@@ -371,10 +466,75 @@ def _expand_xiaohongshu_profile(
     """Extract recent video note URLs from a Xiaohongshu user profile page.
 
     Strategy:
-    1. Navigate to profile, wait for hydration.
-    2. Extract video note IDs from DOM (hidden /explore/{noteId} links).
-    3. Scroll to load more if needed.
+    1. Intercept profile JSON responses and collect video note IDs.
+    2. Navigate to profile, waiting for interactive login when required.
+    3. Extract video note IDs from DOM and scroll to load more if needed.
     """
+    seen_note_ids: set[str] = set()
+    collected_video_urls: list[str] = []
+
+    def _add_note(value: object, token: object = "", source: object = "") -> None:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9]{16,32}", value):
+            return
+        if value not in seen_note_ids:
+            seen_note_ids.add(value)
+            query: dict[str, str] = {}
+            if isinstance(token, str) and token:
+                query["xsec_token"] = token
+            if isinstance(source, str) and source:
+                query["xsec_source"] = source
+            suffix = f"?{urlencode(query)}" if query else ""
+            collected_video_urls.append(f"{XHS_EXPLORE_URL_TEMPLATE.format(note_id=value)}{suffix}")
+
+    def _collect_from_json(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                _collect_from_json(item)
+            return
+        if not isinstance(value, dict):
+            return
+        note_card = value.get("note_card")
+        card = note_card if isinstance(note_card, dict) else value
+        note_type = str(card.get("type") or card.get("note_type") or "").lower()
+        has_video = (
+            note_type == "video"
+            or isinstance(card.get("video"), dict)
+            or isinstance(card.get("video_info"), dict)
+            or isinstance(card.get("videoInfo"), dict)
+        )
+        if has_video:
+            token = (
+                value.get("xsec_token")
+                or value.get("xsecToken")
+                or card.get("xsec_token")
+                or card.get("xsecToken")
+            )
+            source = (
+                value.get("xsec_source")
+                or value.get("xsecSource")
+                or card.get("xsec_source")
+                or card.get("xsecSource")
+                or "pc_user"
+            )
+            _add_note(value.get("note_id") or value.get("noteId") or value.get("id"), token, source)
+            _add_note(card.get("note_id") or card.get("noteId") or card.get("id"), token, source)
+        for nested in value.values():
+            if isinstance(nested, (dict, list)):
+                _collect_from_json(nested)
+
+    def on_response(response: Response) -> None:
+        url = response.url.lower()
+        content_type = response.headers.get("content-type", "").lower()
+        if "application/json" not in content_type:
+            return
+        if not any(hint in url for hint in ("user_posted", "/feed", "/note", "xiaohongshu")):
+            return
+        try:
+            _collect_from_json(response.json())
+        except Exception:
+            return
+
+    page.on("response", on_response)
     log_info("profile.expand.start", site="xiaohongshu", url=full_url(profile_url), max_videos=max_videos)
 
     try:
@@ -390,28 +550,39 @@ def _expand_xiaohongshu_profile(
 
     page.wait_for_timeout(3000)
 
-    # Extract video note IDs from DOM
-    seen_note_ids: set[str] = set()
-    collected_note_ids: list[str] = []
-
     def _collect_from_dom() -> None:
-        for nid in _extract_xhs_video_note_ids_from_dom(page):
-            if nid not in seen_note_ids:
-                seen_note_ids.add(nid)
-                collected_note_ids.append(nid)
+        for video_url in _extract_xhs_video_urls_from_dom(page):
+            match = XHS_NOTE_LINK_RE.search(video_url)
+            if not match or match.group(1) in seen_note_ids:
+                continue
+            seen_note_ids.add(match.group(1))
+            collected_video_urls.append(urljoin(profile_url, video_url))
 
     _collect_from_dom()
-    log_info("profile.expand.dom", site="xiaohongshu", found=len(collected_note_ids))
+    log_info("profile.expand.dom", site="xiaohongshu", found=len(collected_video_urls))
+
+    if not collected_video_urls and _xhs_login_prompt_visible(page):
+        login_timeout_secs = max(180, timeout_secs * 4)
+        if not _wait_for_xhs_login(page, timeout_secs=login_timeout_secs):
+            raise DownloadError(
+                f"小红书登录等待超时（{login_timeout_secs} 秒）。请重新下载，并在弹出的浏览器中完成登录。"
+            )
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(timeout_secs * 1000, 8000))
+        except Exception:
+            pass
+        _collect_from_dom()
+        log_info("profile.expand.dom_after_login", site="xiaohongshu", found=len(collected_video_urls))
 
     # Scroll to load more if needed
     scroll_attempts = 0
     max_scroll_attempts = 5
-    while len(collected_note_ids) < max_videos and scroll_attempts < max_scroll_attempts:
-        prev_count = len(collected_note_ids)
+    while len(collected_video_urls) < max_videos and scroll_attempts < max_scroll_attempts:
+        prev_count = len(collected_video_urls)
         page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
         page.wait_for_timeout(2000)
         _collect_from_dom()
-        if len(collected_note_ids) == prev_count:
+        if len(collected_video_urls) == prev_count:
             scroll_attempts += 1
         else:
             scroll_attempts = 0
@@ -423,16 +594,13 @@ def _expand_xiaohongshu_profile(
         "span.name",
     ])
 
-    video_urls = [
-        XHS_EXPLORE_URL_TEMPLATE.format(note_id=note_id)
-        for note_id in collected_note_ids[:max_videos]
-    ]
+    video_urls = collected_video_urls[:max_videos]
     log_info(
         "profile.expand.complete",
         site="xiaohongshu",
         url=full_url(profile_url),
         author=author,
-        found=len(collected_note_ids),
+        found=len(collected_video_urls),
         returned=len(video_urls),
     )
     return ProfileExpandResult(video_urls=video_urls, pinned_urls=[], author=author)

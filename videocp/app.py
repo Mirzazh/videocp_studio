@@ -44,6 +44,7 @@ YOUTUBE_COOKIE_HELP = (
     "建议用隐身窗口登录 YouTube，打开 https://www.youtube.com/robots.txt 后导出 youtube.com Cookie。"
 )
 YTDLP_DOWNLOAD_TIMEOUT_SECS = 300
+YOUTUBE_LOW_FORMAT_FALLBACK_ARGS = "youtube:player_client=web_safari"
 
 
 @dataclass(slots=True)
@@ -62,6 +63,7 @@ class DownloadOptions:
     profile_videos_count: int = 3
     profile_order: str = "latest"
     bilibili_download_mode: str = "tv"
+    quality: str = "best"
     ytdlp_extractor_args: str = ""
     ytdlp_cookies_file: Path | None = None
     ytdlp_remote_components: bool = False
@@ -321,6 +323,10 @@ def _expand_profile_inputs(
                     )
                 finally:
                     page.close()
+                if profile_input.provider_key == "xiaohongshu" and not result.video_urls:
+                    raise DownloadError(
+                        "小红书主页没有解析到可下载的视频。请确认已经登录、主页中存在视频笔记，然后重试。"
+                    )
                 for url in result.pinned_urls:
                     expanded.append(ParsedInput(
                         raw_input=url,
@@ -460,6 +466,7 @@ def _download_bilibili_input(
     watermark: WatermarkConfig | None = None,
     max_video_duration_secs: int = 0,
     bilibili_download_mode: str = "tv",
+    quality: str = "best",
 ) -> tuple[ExtractionResult, DownloadArtifact]:
     kwargs = {
         "source_url": parsed.canonical_url,
@@ -469,6 +476,7 @@ def _download_bilibili_input(
         "watermark": watermark,
         "author_hint": parsed.author_hint,
         "bilibili_download_mode": bilibili_download_mode,
+        "quality": quality,
     }
     if max_video_duration_secs > 0:
         kwargs["max_video_duration_secs"] = max_video_duration_secs
@@ -485,6 +493,7 @@ def _download_ytdlp_input(
     cookies_file: Path | None = None,
     remote_components: bool = False,
     force_redownload: bool = False,
+    quality: str = "best",
 ) -> tuple[ExtractionResult, DownloadArtifact]:
     """Download a video via yt-dlp, optionally using a user-provided cookies.txt file."""
     del browser_config
@@ -502,6 +511,33 @@ def _download_ytdlp_input(
         if is_youtube_url:
             raise DownloadError(_youtube_error_message(exc)) from exc
         raise
+    effective_extractor_args = extractor_args
+    if is_youtube_url and 0 < meta.max_resolution <= 360:
+        log_warn(
+            "ytdlp.metadata.low_quality_retry",
+            formats=meta.formats_count,
+            max_resolution=meta.max_resolution,
+            fallback_client="web_safari",
+        )
+        try:
+            fallback_meta = fetch_ytdlp_metadata(
+                parsed.canonical_url,
+                cookies_file,
+                extractor_args=YOUTUBE_LOW_FORMAT_FALLBACK_ARGS,
+                remote_components=remote_components,
+            )
+        except DownloadError as exc:
+            log_warn("ytdlp.metadata.low_quality_retry_failed", error=str(exc))
+        else:
+            if fallback_meta.max_resolution > meta.max_resolution:
+                meta = fallback_meta
+                effective_extractor_args = YOUTUBE_LOW_FORMAT_FALLBACK_ARGS
+                log_info(
+                    "ytdlp.metadata.low_quality_recovered",
+                    formats=meta.formats_count,
+                    max_resolution=meta.max_resolution,
+                    player_client="web_safari",
+                )
     if meta.site == "youtube" and meta.formats_count == 0:
         raise DownloadError(
             f"{YOUTUBE_COOKIE_HELP} yt-dlp 已识别视频标题，但没有返回可下载的视频格式。"
@@ -551,23 +587,42 @@ def _download_ytdlp_input(
     _raise_if_duration_exceeds_limit(extraction, max_video_duration_secs)
     subdir = build_output_subdir(extraction)
     stem = build_output_stem(extraction)
-    output_path = allocate_output_path(output_dir, subdir, stem)
+    if force_redownload:
+        target_dir = output_dir / subdir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        output_path = target_dir / f"{stem}.mp4"
+        download_path = target_dir / f"{stem}.redownload.mp4"
+    else:
+        output_path = allocate_output_path(output_dir, subdir, stem)
+        download_path = output_path
     sidecar_path = output_path.with_suffix(".json")
 
     # Download
     try:
         download_with_ytdlp(
             url=parsed.canonical_url,
-            output_path=output_path,
+            output_path=download_path,
             cookies_file=cookies_file,
             timeout_secs=max(timeout_secs, YTDLP_DOWNLOAD_TIMEOUT_SECS),
-            extractor_args=extractor_args,
+            extractor_args=effective_extractor_args,
             remote_components=remote_components,
+            quality=quality,
         )
     except DownloadError as exc:
         if is_youtube_url:
             raise DownloadError(_youtube_error_message(exc)) from exc
         raise
+    if download_path != output_path:
+        download_path.replace(output_path)
+
+    width, height = probe_video_dimensions(output_path)
+    log_info(
+        "ytdlp.download.quality",
+        content_id=metadata.content_id or "unknown",
+        width=width,
+        height=height,
+        quality=quality,
+    )
 
     # Write sidecar
     sidecar_payload = {
@@ -583,7 +638,12 @@ def _download_ytdlp_input(
         "chosen_candidate": candidate.to_dict(),
         "watermark_mode": candidate.watermark_mode.value,
         "candidates": [candidate.to_dict()],
-        "diagnostics": extraction.diagnostics,
+        "diagnostics": {
+            **extraction.diagnostics,
+            "download_quality": quality,
+            "video_width": width,
+            "video_height": height,
+        },
         "attempts": [{"url": parsed.canonical_url, "mode": "ytdlp", "status": "ok"}],
     }
     sidecar_path.write_text(
@@ -615,6 +675,7 @@ def _run_download_jobs(
     ytdlp_remote_components: bool = False,
     force_redownload: bool = False,
     bilibili_download_mode: str = "tv",
+    quality: str = "best",
 ) -> list[DownloadJobResult]:
     results: list[DownloadJobResult | None] = [None] * len(prepared_inputs)
     total_limit = max(1, max_concurrent)
@@ -679,6 +740,7 @@ def _run_download_jobs(
                     "cookies_file": ytdlp_cookies_file,
                     "remote_components": ytdlp_remote_components,
                     "force_redownload": force_redownload,
+                    "quality": quality,
                 }
                 if max_video_duration_secs > 0:
                     kwargs["max_video_duration_secs"] = max_video_duration_secs
@@ -707,6 +769,7 @@ def _run_download_jobs(
                         "cookies_file": ytdlp_cookies_file,
                         "remote_components": ytdlp_remote_components,
                         "force_redownload": force_redownload,
+                        "quality": quality,
                     }
                     if max_video_duration_secs > 0:
                         kwargs["max_video_duration_secs"] = max_video_duration_secs
@@ -719,6 +782,7 @@ def _run_download_jobs(
                         "timeout_secs": timeout_secs,
                         "watermark": watermark,
                         "bilibili_download_mode": bilibili_download_mode,
+                        "quality": quality,
                     }
                     if max_video_duration_secs > 0:
                         kwargs["max_video_duration_secs"] = max_video_duration_secs
@@ -906,6 +970,7 @@ def download_videos(options: DownloadOptions) -> list[tuple[ExtractionResult, Do
         ytdlp_remote_components=options.ytdlp_remote_components,
         force_redownload=options.force_redownload,
         bilibili_download_mode=options.bilibili_download_mode,
+        quality=options.quality,
     )
     failures = [item for item in job_results if not item.ok]
     if failures:
@@ -960,6 +1025,7 @@ def download_jobs(options: DownloadOptions) -> list[DownloadJobResult]:
         ytdlp_remote_components=options.ytdlp_remote_components,
         force_redownload=options.force_redownload,
         bilibili_download_mode=options.bilibili_download_mode,
+        quality=options.quality,
     )
 
 

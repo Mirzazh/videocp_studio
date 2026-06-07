@@ -39,6 +39,7 @@ DEFAULT_APP_CONFIG = {
         "order": "latest",
         "count": 3,
         "bilibili_download_mode": "tv",
+        "quality": "best",
         "youtube_auto_token": False,
         "ytdlp_extractor_args": "",
     },

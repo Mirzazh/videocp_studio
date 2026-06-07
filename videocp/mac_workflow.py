@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+import requests
+
 from videocp.app import DownloadOptions, download_jobs
 from videocp.browser import BrowserConfig, open_download_browser_session
 from videocp.config import AppConfig, WatermarkConfig, load_app_config
@@ -16,13 +18,17 @@ from videocp.profile import default_profile_dir, detect_system_browser_executabl
 from videocp.profile_expander import expand_profile
 from videocp.publisher import PublishResult, check_tencent_login_status, is_login_state_publish_error, publish_to_channel
 from videocp.runtime_log import log_warn
-from videocp.sync_history import SyncHistoryEntry, add_entry, find_processed_entry, load_history
+from videocp.sync_history import SyncHistoryEntry, add_entry, find_processed_entry, load_history, replace_entry
 from videocp.ytdlp import YtdlpPlaylistResult, expand_ytdlp_playlist
 
 
 VIDEO_SUFFIXES = {".mp4", ".m4v", ".mov", ".webm", ".mkv"}
 TAG_OR_MENTION_RE = re.compile(r"[#@][^\s#@]+")
+CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 DEFAULT_YOUTUBE_EXTRACTOR_ARGS = "youtube:player_client=mweb;fetch_pot=always"
+GOOGLE_TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+EDGE_TRANSLATE_AUTH_ENDPOINT = "https://edge.microsoft.com/translate/auth"
+EDGE_TRANSLATE_ENDPOINT = "https://api-edge.cognitive.microsofttranslator.com/translate"
 
 
 @dataclass(slots=True)
@@ -153,6 +159,9 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
     bilibili_download_mode = str(download_raw.get("bilibili_download_mode") or app_cfg.bilibili_download_mode or "tv").strip().lower()
     if bilibili_download_mode not in {"tv", "web", "ytdlp"}:
         bilibili_download_mode = "tv"
+    quality = str(download_raw.get("quality") or "best").strip().lower()
+    if quality not in {"best", "2160", "1080", "720", "480"}:
+        quality = "best"
     history = load_history(history_file)
     publish_history_file = resolve_config_path(
         (app_config.get("publish") or {}).get("history_file", "./publish_history_mac.json"),
@@ -187,6 +196,7 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
             profile_videos_count=count,
             profile_order=order,
             bilibili_download_mode=bilibili_download_mode,
+            quality=quality,
             ytdlp_extractor_args=ytdlp_extractor_args,
             ytdlp_cookies_file=ytdlp_cookies_file,
             ytdlp_remote_components=ytdlp_remote_components,
@@ -198,19 +208,20 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
     for item in results:
         meta = item.extraction.metadata if item.extraction else None
         reused = bool(item.ok and item.artifact and item.artifact.attempts and item.artifact.attempts[0].get("mode") == "reuse")
-        if item.ok and meta and meta.content_id and find_processed_entry(history, "directory_download", meta.content_id) is None:
-            add_entry(
-                history,
-                SyncHistoryEntry(
-                    task_name="directory_download",
-                    content_id=meta.content_id,
-                    site=meta.site,
-                    author=meta.author,
-                    desc=meta.desc,
-                    output_path=str(item.artifact.output_path) if item.artifact else "",
-                    status="ok",
-                ),
+        if item.ok and meta and meta.content_id:
+            history_entry = SyncHistoryEntry(
+                task_name="directory_download",
+                content_id=meta.content_id,
+                site=meta.site,
+                author=meta.author,
+                desc=meta.desc,
+                output_path=str(item.artifact.output_path) if item.artifact else "",
+                status="ok",
             )
+            if force_redownload:
+                replace_entry(history, history_entry)
+            elif find_processed_entry(history, "directory_download", meta.content_id) is None:
+                add_entry(history, history_entry)
         payload.append(
             WorkflowResult(
                 ok=item.ok,
@@ -247,7 +258,7 @@ def parse_profile_from_app_config(app_config_path: Path, profile_url: str) -> di
         )
     except Exception as exc:
         netloc = urlparse(url).netloc.lower()
-        browser_fallback_hosts = ("space.bilibili.com", "douyin.com")
+        browser_fallback_hosts = ("space.bilibili.com", "douyin.com", "xiaohongshu.com", "xhslink.com")
         if not any(host in netloc for host in browser_fallback_hosts):
             return ProfileParseResult(ok=False, url=url, error=str(exc)).to_dict()
         app_cfg = _workflow_app_config(base_dir, resolve_config_path(download_raw.get("output_dir", "./downloads"), base_dir))
@@ -301,12 +312,101 @@ def _clean_title(title: str, strip_tags_mentions: bool) -> str:
     return cleaned
 
 
+def _preferred_sidecar_title(sidecar: dict[str, Any], fallback: str) -> str:
+    explicit_candidates = [
+        sidecar.get("title_zh_cn"),
+        sidecar.get("title_zh"),
+        sidecar.get("zh_title"),
+        sidecar.get("localized_title"),
+        sidecar.get("translated_title"),
+    ]
+    for container_key in ("titles", "localized_titles", "translations"):
+        container = sidecar.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for language_key in ("zh-CN", "zh-Hans", "zh_CN", "zh", "cn"):
+            value = container.get(language_key)
+            if isinstance(value, dict):
+                value = value.get("title") or value.get("text")
+            explicit_candidates.append(value)
+
+    normal_candidates = [sidecar.get("title"), sidecar.get("desc")]
+    for value in [*explicit_candidates, *normal_candidates]:
+        text = str(value or "").strip()
+        if text and CHINESE_TEXT_RE.search(text):
+            return text
+    for value in [*explicit_candidates, *normal_candidates]:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return fallback
+
+
 def _format_template(template: str, values: dict[str, str]) -> str:
     class SafeMap(dict):
         def __missing__(self, key: str) -> str:
             return "{" + key + "}"
 
     return str(template or "{title}").format_map(SafeMap(values))
+
+
+def _translate_with_edge(text: str, timeout_secs: int) -> str:
+    auth_response = requests.get(EDGE_TRANSLATE_AUTH_ENDPOINT, timeout=timeout_secs)
+    auth_response.raise_for_status()
+    token = auth_response.text.strip()
+    if not token:
+        raise RuntimeError("Edge 翻译授权为空")
+    response = requests.post(
+        EDGE_TRANSLATE_ENDPOINT,
+        params={"api-version": "3.0", "to": "zh-Hans"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=[{"Text": text}],
+        timeout=timeout_secs,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return str(payload[0]["translations"][0]["text"]).strip()
+
+
+def _translate_with_google(text: str, timeout_secs: int) -> str:
+    response = requests.get(
+        GOOGLE_TRANSLATE_ENDPOINT,
+        params={
+            "client": "gtx",
+            "sl": "auto",
+            "tl": "zh-CN",
+            "dt": "t",
+            "q": text,
+        },
+        timeout=timeout_secs,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return "".join(
+        segment[0]
+        for segment in (payload[0] if isinstance(payload, list) and payload else [])
+        if isinstance(segment, list) and segment and isinstance(segment[0], str)
+    ).strip()
+
+
+def _translate_title_to_simplified_chinese(title: str, timeout_secs: int = 12) -> str:
+    text = str(title or "").strip()
+    if not text:
+        return text
+    errors: list[str] = []
+    translated = ""
+    for name, translator in (("Edge", _translate_with_edge), ("Google", _translate_with_google)):
+        try:
+            translated = translator(text, max(3, timeout_secs))
+        except (requests.RequestException, RuntimeError, ValueError, TypeError, IndexError, KeyError) as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        if translated:
+            break
+    if not translated:
+        detail = "；".join(errors) if errors else "翻译服务未返回内容"
+        raise RuntimeError(f"标题翻译失败：{detail}")
+    return translated
 
 
 def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
@@ -331,6 +431,7 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
     feed_type = int(publish_raw.get("feed_type") or 1)
     limit = max(1, int(publish_raw.get("limit") or 1))
     strip_tags_mentions = _as_bool(publish_raw.get("strip_tags_mentions"), True)
+    translate_title_zh_cn = _as_bool(publish_raw.get("translate_title_zh_cn"), False)
     delete_after_publish = _as_bool(publish_raw.get("delete_after_publish"), True)
     retry_count = max(0, min(5, int(publish_raw.get("retry_count") or 2)))
     title_template = str(publish_raw.get("title_template") or "{title}")
@@ -369,7 +470,37 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
             continue
 
         raw_title = str(sidecar.get("title") or sidecar.get("desc") or video_path.stem)
-        clean_title = _clean_title(raw_title, strip_tags_mentions)
+        preferred_title = _preferred_sidecar_title(sidecar, video_path.stem)
+        clean_title = _clean_title(preferred_title, strip_tags_mentions)
+        if translate_title_zh_cn:
+            try:
+                clean_title = _translate_title_to_simplified_chinese(clean_title)
+            except RuntimeError as exc:
+                error = str(exc)
+                add_entry(
+                    history,
+                    SyncHistoryEntry(
+                        task_name=task_name,
+                        content_id=content_id,
+                        site=str(sidecar.get("site", "")),
+                        author=str(sidecar.get("author", "")),
+                        desc=str(sidecar.get("desc", "")) or clean_title,
+                        output_path=str(video_path),
+                        status="failed",
+                        error=error,
+                    ),
+                )
+                payload.append(
+                    WorkflowResult(
+                        ok=False,
+                        action="failed",
+                        path=str(video_path),
+                        content_id=content_id,
+                        title=clean_title,
+                        error=error,
+                    ).to_dict()
+                )
+                continue
         values = {
             "title": clean_title,
             "raw_title": raw_title,

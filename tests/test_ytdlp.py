@@ -37,10 +37,34 @@ def test_download_with_ytdlp_prioritizes_resolution_before_codec(tmp_path: Path,
 
     assert "--ignore-config" in commands[0]
     format_arg = commands[0][commands[0].index("-f") + 1]
-    assert "best" in format_arg
+    assert format_arg == "bv+ba/b"
     sort_arg = commands[0][commands[0].index("-S") + 1]
     assert sort_arg.split(",")[:2] == ["res", "fps"]
     assert "vcodec:h264" in sort_arg
+
+
+def test_download_with_ytdlp_caps_requested_quality(tmp_path: Path, monkeypatch):
+    commands = []
+    output_path = tmp_path / "video.mp4"
+
+    def fake_run(cmd, capture_output, text, timeout):
+        commands.append(cmd)
+        output_path.write_bytes(b"video")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(ytdlp.subprocess, "run", fake_run)
+
+    ytdlp.download_with_ytdlp(
+        "https://www.youtube.com/watch?v=example",
+        output_path,
+        timeout_secs=10,
+        quality="720",
+    )
+
+    format_arg = commands[0][commands[0].index("-f") + 1]
+    sort_arg = commands[0][commands[0].index("-S") + 1]
+    assert format_arg == "bv+ba/b"
+    assert sort_arg.startswith("res:720,")
 
 
 def test_app_youtube_download_uses_longer_subprocess_timeout(tmp_path: Path, monkeypatch):
@@ -67,6 +91,7 @@ def test_app_youtube_download_uses_longer_subprocess_timeout(tmp_path: Path, mon
 
     def fake_download_with_ytdlp(*, output_path: Path, timeout_secs: int, **kwargs):
         captured["timeout_secs"] = timeout_secs
+        captured["quality"] = kwargs.get("quality")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"video")
 
@@ -77,9 +102,100 @@ def test_app_youtube_download_uses_longer_subprocess_timeout(tmp_path: Path, mon
         browser_config=SimpleNamespace(),
         output_dir=tmp_path,
         timeout_secs=30,
+        quality="1080",
     )
 
     assert captured["timeout_secs"] == 300
+    assert captured["quality"] == "1080"
+
+
+def test_app_force_redownload_replaces_existing_file(tmp_path: Path, monkeypatch):
+    parsed = ParsedInput(
+        raw_input="https://www.youtube.com/watch?v=abc",
+        extracted_url="https://www.youtube.com/watch?v=abc",
+        canonical_url="https://www.youtube.com/watch?v=abc",
+        provider_key="ytdlp",
+    )
+    monkeypatch.setattr(
+        app,
+        "fetch_ytdlp_metadata",
+        lambda *args, **kwargs: ytdlp.YtdlpMetadata(
+            id="abc",
+            title="title",
+            uploader="author",
+            site="youtube",
+            url=parsed.canonical_url,
+            formats_count=3,
+        ),
+    )
+    target = tmp_path / "youtube-author" / "abc.mp4"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"old")
+
+    def fake_download_with_ytdlp(*, output_path: Path, **kwargs):
+        assert output_path.name == "abc.redownload.mp4"
+        output_path.write_bytes(b"new")
+
+    monkeypatch.setattr(app, "download_with_ytdlp", fake_download_with_ytdlp)
+    monkeypatch.setattr(app, "probe_video_dimensions", lambda path: (1080, 1920))
+
+    _, artifact = app._download_ytdlp_input(
+        parsed=parsed,
+        browser_config=SimpleNamespace(),
+        output_dir=tmp_path,
+        timeout_secs=30,
+        force_redownload=True,
+    )
+
+    assert artifact.output_path == target
+    assert target.read_bytes() == b"new"
+
+
+def test_app_retries_low_quality_youtube_metadata_with_web_safari(tmp_path: Path, monkeypatch):
+    parsed = ParsedInput(
+        raw_input="https://www.youtube.com/watch?v=abc",
+        extracted_url="https://www.youtube.com/watch?v=abc",
+        canonical_url="https://www.youtube.com/watch?v=abc",
+        provider_key="ytdlp",
+    )
+    metadata_calls = []
+
+    def fake_metadata(url, cookies_file, extractor_args="", remote_components=False):
+        metadata_calls.append(extractor_args)
+        return ytdlp.YtdlpMetadata(
+            id="abc",
+            title="title",
+            uploader="author",
+            site="youtube",
+            url=url,
+            formats_count=5 if len(metadata_calls) == 1 else 42,
+            max_resolution=360 if len(metadata_calls) == 1 else 1080,
+        )
+
+    captured = {}
+
+    def fake_download_with_ytdlp(*, output_path: Path, extractor_args: str, **kwargs):
+        captured["extractor_args"] = extractor_args
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"video")
+
+    monkeypatch.setattr(app, "fetch_ytdlp_metadata", fake_metadata)
+    monkeypatch.setattr(app, "download_with_ytdlp", fake_download_with_ytdlp)
+    monkeypatch.setattr(app, "probe_video_dimensions", lambda path: (1080, 1920))
+
+    app._download_ytdlp_input(
+        parsed=parsed,
+        browser_config=SimpleNamespace(),
+        output_dir=tmp_path,
+        timeout_secs=30,
+        extractor_args="youtube:player_client=mweb;fetch_pot=always",
+    )
+
+    assert metadata_calls == [
+        "youtube:player_client=mweb;fetch_pot=always",
+        "youtube:player_client=web_safari",
+    ]
+    assert captured["extractor_args"] == "youtube:player_client=web_safari"
 
 
 def test_app_youtube_timeout_is_not_reported_as_cookie_setup_failure(tmp_path: Path, monkeypatch):
@@ -143,6 +259,29 @@ def test_fetch_ytdlp_metadata_ignores_empty_formats_and_accepts_extractor_args(m
     assert commands[0][commands[0].index("--extractor-args") + 1] == "youtube:player_client=web"
     assert meta.id == "abc"
     assert meta.formats_count == 0
+    assert meta.max_resolution == 0
+
+
+def test_fetch_ytdlp_metadata_reports_highest_short_edge(monkeypatch):
+    def fake_run(cmd, capture_output, text, timeout):
+        return SimpleNamespace(
+            returncode=0,
+            stderr="",
+            stdout=(
+                '{"id":"abc","title":"标题","uploader":"作者","extractor_key":"Youtube",'
+                '"formats":['
+                '{"format_id":"18","width":360,"height":640,"vcodec":"h264"},'
+                '{"format_id":"137","width":1080,"height":1920,"vcodec":"h264"},'
+                '{"format_id":"140","vcodec":"none","acodec":"m4a"}]}'
+            ),
+        )
+
+    monkeypatch.setattr(ytdlp.subprocess, "run", fake_run)
+
+    meta = ytdlp.fetch_ytdlp_metadata("https://www.youtube.com/shorts/abc")
+
+    assert meta.formats_count == 3
+    assert meta.max_resolution == 1080
 
 
 def test_fetch_ytdlp_metadata_adds_bundled_youtube_helper(monkeypatch):

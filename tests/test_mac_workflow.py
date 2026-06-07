@@ -2,7 +2,14 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from videocp.mac_workflow import _clean_title, parse_profile_from_app_config, run_download_from_app_config, run_publish_from_app_config
+from videocp.mac_workflow import (
+    _clean_title,
+    _preferred_sidecar_title,
+    _translate_title_to_simplified_chinese,
+    parse_profile_from_app_config,
+    run_download_from_app_config,
+    run_publish_from_app_config,
+)
 from videocp.publisher import PublishResult
 from videocp.ytdlp import YtdlpPlaylistResult
 
@@ -13,6 +20,34 @@ def test_clean_title_strips_tags_and_mentions():
     assert _clean_title("原始标题 #热点", False) == "原始标题 #热点"
 
 
+def test_preferred_sidecar_title_uses_explicit_chinese_title():
+    sidecar = {
+        "title": "English title",
+        "translated_title": "中文标题",
+        "desc": "English description",
+    }
+
+    assert _preferred_sidecar_title(sidecar, "fallback") == "中文标题"
+
+
+def test_preferred_sidecar_title_uses_chinese_description_before_english_title():
+    sidecar = {
+        "title": "English title",
+        "desc": "这是中文简介",
+    }
+
+    assert _preferred_sidecar_title(sidecar, "fallback") == "这是中文简介"
+
+
+def test_preferred_sidecar_title_supports_nested_localized_titles():
+    sidecar = {
+        "title": "English title",
+        "localized_titles": {"zh-Hans": {"title": "嵌套中文标题"}},
+    }
+
+    assert _preferred_sidecar_title(sidecar, "fallback") == "嵌套中文标题"
+
+
 def test_download_from_app_config_writes_cookie_text_and_uses_youtube_defaults(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "mac-app.json"
     config_path.write_text(
@@ -21,6 +56,7 @@ def test_download_from_app_config_writes_cookie_text_and_uses_youtube_defaults(t
                 "download": {
                     "inputs_text": "https://www.youtube.com/shorts/demo",
                     "output_dir": str(tmp_path / "downloads"),
+                    "quality": "720",
                     "youtube_cookies_text": ".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tdemo",
                 }
             }
@@ -39,6 +75,7 @@ def test_download_from_app_config_writes_cookie_text_and_uses_youtube_defaults(t
     options = captured["options"]
     assert options.ytdlp_extractor_args == "youtube:player_client=mweb;fetch_pot=always"
     assert options.ytdlp_remote_components is True
+    assert options.quality == "720"
     assert options.ytdlp_cookies_file is not None
     cookie_text = options.ytdlp_cookies_file.read_text(encoding="utf-8")
     assert "# Netscape HTTP Cookie File" in cookie_text
@@ -326,6 +363,61 @@ def test_parse_douyin_profile_falls_back_to_browser_expansion(tmp_path: Path, mo
     assert result["first_video_url"] == "https://www.douyin.com/video/123456"
 
 
+def test_parse_xiaohongshu_profile_falls_back_to_browser_expansion(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def new_page(self):
+            return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr("videocp.mac_workflow.expand_ytdlp_playlist", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("unsupported")))
+    monkeypatch.setattr("videocp.mac_workflow.detect_system_browser_executable", lambda: "/Applications/Google Chrome.app")
+    monkeypatch.setattr("videocp.mac_workflow.open_download_browser_session", lambda *_: FakeBrowser())
+    monkeypatch.setattr(
+        "videocp.mac_workflow.expand_profile",
+        lambda **kwargs: SimpleNamespace(
+            video_urls=["https://www.xiaohongshu.com/explore/69be081c0000000021010b12"],
+            author="小红书作者",
+        ),
+    )
+
+    result = parse_profile_from_app_config(
+        config_path,
+        "https://www.xiaohongshu.com/user/profile/123456",
+    )
+
+    assert result["ok"] is True
+    assert result["name"] == "小红书作者"
+    assert result["first_video_url"] == "https://www.xiaohongshu.com/explore/69be081c0000000021010b12"
+
+
+def test_translate_title_to_simplified_chinese(monkeypatch):
+    monkeypatch.setattr("videocp.mac_workflow._translate_with_edge", lambda *args: "救援成功")
+    monkeypatch.setattr(
+        "videocp.mac_workflow._translate_with_google",
+        lambda *args: (_ for _ in ()).throw(AssertionError("Edge 成功后不应调用 Google")),
+    )
+
+    assert _translate_title_to_simplified_chinese("Rescue successful") == "救援成功"
+
+
+def test_translate_title_falls_back_to_google(monkeypatch):
+    monkeypatch.setattr(
+        "videocp.mac_workflow._translate_with_edge",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("edge unavailable")),
+    )
+    monkeypatch.setattr("videocp.mac_workflow._translate_with_google", lambda *args: "救援成功")
+
+    assert _translate_title_to_simplified_chinese("Rescue successful") == "救援成功"
+
+
 def test_publish_from_directory_uses_sidecar_title_records_and_deletes(tmp_path: Path, monkeypatch):
     video = tmp_path / "downloads" / "demo.mp4"
     video.parent.mkdir()
@@ -380,6 +472,130 @@ def test_publish_from_directory_uses_sidecar_title_records_and_deletes(tmp_path:
     assert not video.with_suffix(".json").exists()
     history = json.loads((tmp_path / "history.json").read_text(encoding="utf-8"))
     assert history["entries"][0]["content_id"] == "cid-1"
+
+
+def test_publish_translates_cleaned_title_before_templates(tmp_path: Path, monkeypatch):
+    video = tmp_path / "downloads" / "demo.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    video.with_suffix(".json").write_text(
+        json.dumps({"content_id": "translated", "title": "Rescue successful #shorts"}),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(video.parent),
+                    "history_file": str(tmp_path / "history.json"),
+                    "translate_title_zh_cn": True,
+                    "delete_after_publish": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+    monkeypatch.setattr("videocp.mac_workflow._translate_title_to_simplified_chinese", lambda title: f"中文：{title}")
+    monkeypatch.setattr(
+        "videocp.mac_workflow.publish_to_channel",
+        lambda **kwargs: captured.update(kwargs) or PublishResult(
+            success=True,
+            feed_id="feed-translated",
+            share_url="https://pd.qq.com/translated",
+        ),
+    )
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["ok"] is True
+    assert captured["content"] == "中文：Rescue successful"
+
+
+def test_publish_prefers_existing_chinese_title_without_translation(tmp_path: Path, monkeypatch):
+    video = tmp_path / "downloads" / "demo.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    video.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "content_id": "prefer-chinese",
+                "title": "English title",
+                "translated_title": "已有中文标题 #话题",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(video.parent),
+                    "history_file": str(tmp_path / "history.json"),
+                    "translate_title_zh_cn": False,
+                    "delete_after_publish": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+    monkeypatch.setattr(
+        "videocp.mac_workflow.publish_to_channel",
+        lambda **kwargs: captured.update(kwargs) or PublishResult(
+            success=True,
+            feed_id="feed-chinese",
+            share_url="https://pd.qq.com/chinese",
+        ),
+    )
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["ok"] is True
+    assert captured["content"] == "已有中文标题"
+
+
+def test_publish_translation_failure_keeps_video_and_records_failure(tmp_path: Path, monkeypatch):
+    video = tmp_path / "downloads" / "demo.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    video.with_suffix(".json").write_text(
+        json.dumps({"content_id": "translate-failed", "title": "Rescue successful"}),
+        encoding="utf-8",
+    )
+    history_path = tmp_path / "history.json"
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(video.parent),
+                    "history_file": str(history_path),
+                    "translate_title_zh_cn": True,
+                    "delete_after_publish": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "videocp.mac_workflow._translate_title_to_simplified_chinese",
+        lambda title: (_ for _ in ()).throw(RuntimeError("标题翻译失败：网络不可用")),
+    )
+    called = []
+    monkeypatch.setattr("videocp.mac_workflow.publish_to_channel", lambda **kwargs: called.append(kwargs))
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["ok"] is False
+    assert "标题翻译失败" in result[0]["error"]
+    assert video.exists()
+    assert called == []
+    history = json.loads(history_path.read_text(encoding="utf-8"))
+    assert history["entries"][0]["status"] == "failed"
 
 
 def test_publish_channel_scope_requires_channel_ids(tmp_path: Path):

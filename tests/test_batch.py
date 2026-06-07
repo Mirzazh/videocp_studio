@@ -196,6 +196,7 @@ def test_download_jobs_respects_per_site_limit(tmp_path: Path, monkeypatch):
             author_hint,
             metadata_seed=None,
             bilibili_download_mode="tv",
+            quality="best",
         ):
         nonlocal active_total, peak_total
         with guard:
@@ -469,6 +470,7 @@ def test_download_jobs_uses_bbdown_for_bilibili(tmp_path: Path, monkeypatch):
             author_hint,
             metadata_seed=None,
             bilibili_download_mode="tv",
+            quality="best",
         ):
         output_path = output_dir / "BV1764y1y76G.mp4"
         sidecar_path = output_dir / "BV1764y1y76G.json"

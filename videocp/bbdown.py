@@ -97,6 +97,12 @@ QUALITY_PRIORITY = {
     "6": 0,
     "5": -1,
 }
+QUALITY_MAX_PRIORITY = {
+    "2160": QUALITY_PRIORITY["126"],
+    "1080": QUALITY_PRIORITY["116"],
+    "720": QUALITY_PRIORITY["74"],
+    "480": QUALITY_PRIORITY["32"],
+}
 
 CODEC_COMPAT_PRIORITY = {
     7: 3,   # AVC / H.264
@@ -508,6 +514,7 @@ def download_bilibili_with_bbdown(
     author_hint: str = "",
     max_video_duration_secs: int = 0,
     bilibili_download_mode: str = "tv",
+    quality: str = "best",
 ) -> tuple[ExtractionResult, DownloadArtifact]:
     page_info = fetch_bilibili_page_info(source_url, timeout_secs=timeout_secs, author_hint=author_hint)
     metadata = build_bbdown_metadata(
@@ -579,6 +586,7 @@ def download_bilibili_with_bbdown(
 
     if not candidates:
         raise DownloadError("Bilibili API returned no playable candidates (web + tv both exhausted).")
+    candidates = filter_bilibili_candidates_by_quality(candidates, quality)
 
     # Web API 模式：传递 Cookie + 桌面浏览器 UA 以通过 CDN 验证
     if download_mode == "web_api" and current_web_cookies:
@@ -622,6 +630,44 @@ def download_bilibili_with_bbdown(
         watermark=watermark,
     )
     return extraction, artifact
+
+
+def filter_bilibili_candidates_by_quality(
+    candidates: list[MediaCandidate],
+    quality: str,
+) -> list[MediaCandidate]:
+    normalized = str(quality or "best").strip().lower()
+    max_priority = QUALITY_MAX_PRIORITY.get(normalized)
+    if max_priority is None:
+        return candidates
+    video_candidates = [candidate for candidate in candidates if candidate.track_type != TrackType.AUDIO_ONLY]
+    audio_candidates = [candidate for candidate in candidates if candidate.track_type == TrackType.AUDIO_ONLY]
+
+    def qn(candidate: MediaCandidate) -> int:
+        match = re.search(r"(?:^|;)qn=(\d+)", candidate.note)
+        return int(match.group(1)) if match else 0
+
+    eligible = [
+        candidate
+        for candidate in video_candidates
+        if QUALITY_PRIORITY.get(str(qn(candidate)), -1) <= max_priority
+    ]
+    if not eligible and video_candidates:
+        eligible = [min(video_candidates, key=lambda candidate: QUALITY_PRIORITY.get(str(qn(candidate)), qn(candidate)))]
+        log_warn(
+            "bbdown.quality.fallback",
+            requested=normalized,
+            selected_qn=qn(eligible[0]),
+            reason="no_stream_at_or_below_requested_quality",
+        )
+    else:
+        log_info(
+            "bbdown.quality.selected",
+            requested=normalized,
+            candidate_count=len(eligible),
+            highest_qn=qn(eligible[0]) if eligible else "none",
+        )
+    return eligible + audio_candidates
 
 
 def fetch_bilibili_page_info(source_url: str, timeout_secs: int, author_hint: str = "") -> BilibiliPageInfo:

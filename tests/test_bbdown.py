@@ -7,6 +7,7 @@ from videocp.bbdown import (
     download_bilibili_with_bbdown,
     fetch_bilibili_page_info,
     fetch_bilibili_tv_candidates,
+    filter_bilibili_candidates_by_quality,
     infer_bbdown_select_page,
     load_bbdown_tv_token,
     save_bbdown_tv_token,
@@ -139,6 +140,37 @@ def test_fetch_bilibili_tv_candidates_prefers_avc_at_same_quality(monkeypatch):
     )
 
     assert candidates[0].url == "https://cdn.example.com/v80-avc.m4s"
+
+
+def test_filter_bilibili_candidates_respects_resolution_tiers():
+    def candidate(qn: int, track_type: TrackType = TrackType.VIDEO_ONLY) -> MediaCandidate:
+        return MediaCandidate(
+            url=f"https://cdn.example.com/{qn}.m4s",
+            kind=MediaKind.MP4,
+            track_type=track_type,
+            watermark_mode=WatermarkMode.NO_WATERMARK,
+            source="tv_api",
+            observed_via="api",
+            note=f"qn={qn};bandwidth=1000",
+        )
+
+    audio = candidate(30280, TrackType.AUDIO_ONLY)
+    candidates = [candidate(127), candidate(126), candidate(120), candidate(116), candidate(74), audio]
+
+    selected_4k = filter_bilibili_candidates_by_quality(candidates, "2160")
+    selected_720 = filter_bilibili_candidates_by_quality(candidates, "720")
+
+    assert [item.url for item in selected_4k] == [
+        "https://cdn.example.com/126.m4s",
+        "https://cdn.example.com/120.m4s",
+        "https://cdn.example.com/116.m4s",
+        "https://cdn.example.com/74.m4s",
+        audio.url,
+    ]
+    assert [item.url for item in selected_720] == [
+        "https://cdn.example.com/74.m4s",
+        audio.url,
+    ]
 
 
 def test_download_bilibili_with_bbdown_uses_python_tv_pipeline(tmp_path: Path, monkeypatch):
