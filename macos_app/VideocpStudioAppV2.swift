@@ -24,10 +24,11 @@ struct SchedulerConfig: Codable {
     var download: DownloadSettings = DownloadSettings()
     var publish: PublishSettings = PublishSettings()
     var automation: AutomationSettings = AutomationSettings()
+    var tencent_accounts: [TencentAccount] = []
     var sources: [VideoSource] = []
 
     enum CodingKeys: String, CodingKey {
-        case tasks_file, run_interval_minutes, active_start, active_end, sync, cleanup, download, publish, automation, sources
+        case tasks_file, run_interval_minutes, active_start, active_end, sync, cleanup, download, publish, automation, tencent_accounts, sources
     }
 
     init() {}
@@ -43,7 +44,24 @@ struct SchedulerConfig: Codable {
         download = try c.decodeIfPresent(DownloadSettings.self, forKey: .download) ?? download
         publish = try c.decodeIfPresent(PublishSettings.self, forKey: .publish) ?? publish
         automation = try c.decodeIfPresent(AutomationSettings.self, forKey: .automation) ?? automation
+        tencent_accounts = try c.decodeIfPresent([TencentAccount].self, forKey: .tencent_accounts) ?? tencent_accounts
         sources = try c.decodeIfPresent([VideoSource].self, forKey: .sources) ?? sources
+    }
+}
+
+struct TencentAccount: Codable, Identifiable, Equatable {
+    var id: String = UUID().uuidString
+    var name: String = ""
+    var token: String = ""
+    var nickname: String = ""
+    var is_guild_author: Bool = false
+    var verified: Bool = false
+
+    var displayName: String {
+        let remark = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !remark.isEmpty { return remark }
+        let verifiedName = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        return verifiedName.isEmpty ? "频道账号" : verifiedName
     }
 }
 
@@ -182,6 +200,8 @@ struct DownloadHistoryFile: Codable {
 
 struct PublishSettings: Codable {
     var input_dir: String = "./downloads"
+    var input_video: String = ""
+    var account_id: String = ""
     var history_file: String = "./publish_history_mac.json"
     var skill_dir: String = "~/.openclaw/workspace/skills/tencent-channel-community"
     var scope: String = "author_global"
@@ -198,7 +218,7 @@ struct PublishSettings: Codable {
     var retry_video_path: String = ""
 
     enum CodingKeys: String, CodingKey {
-        case input_dir, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
+        case input_dir, input_video, account_id, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
         case title_template, content_template, strip_tags_mentions, title_exclusions, translate_title_zh_cn
         case delete_after_publish, retry_video_path
     }
@@ -208,6 +228,8 @@ struct PublishSettings: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         input_dir = try c.decodeIfPresent(String.self, forKey: .input_dir) ?? input_dir
+        input_video = try c.decodeIfPresent(String.self, forKey: .input_video) ?? input_video
+        account_id = try c.decodeIfPresent(String.self, forKey: .account_id) ?? account_id
         history_file = try c.decodeIfPresent(String.self, forKey: .history_file) ?? history_file
         skill_dir = try c.decodeIfPresent(String.self, forKey: .skill_dir) ?? skill_dir
         scope = try c.decodeIfPresent(String.self, forKey: .scope) ?? scope
@@ -301,6 +323,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
     var id: String = UUID().uuidString
     var settings_version: Int = 1
     var directories: [String] = []
+    var account_id: String = ""
     var interval_minutes: Int = 60
     var order: String = "sequential"
     var enabled: Bool = true
@@ -319,7 +342,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
     var delete_after_publish: Bool = true
 
     enum CodingKeys: String, CodingKey {
-        case id, settings_version, directories, interval_minutes, order, enabled, active_start, active_end
+        case id, settings_version, directories, account_id, interval_minutes, order, enabled, active_start, active_end
         case scope, guild_id, channel_id, feed_type, limit, title_template, content_template
         case strip_tags_mentions, title_exclusions, translate_title_zh_cn, delete_after_publish
     }
@@ -327,6 +350,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
     init(
         id: String = UUID().uuidString,
         directories: [String],
+        account_id: String = "",
         interval_minutes: Int,
         order: String,
         enabled: Bool = true,
@@ -346,6 +370,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
     ) {
         self.id = id
         self.directories = directories
+        self.account_id = account_id
         self.interval_minutes = interval_minutes
         self.order = order
         self.enabled = enabled
@@ -369,6 +394,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
         id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
         settings_version = try c.decodeIfPresent(Int.self, forKey: .settings_version) ?? 0
         directories = try c.decodeIfPresent([String].self, forKey: .directories) ?? []
+        account_id = try c.decodeIfPresent(String.self, forKey: .account_id) ?? ""
         interval_minutes = try c.decodeIfPresent(Int.self, forKey: .interval_minutes) ?? 60
         order = try c.decodeIfPresent(String.self, forKey: .order) ?? "sequential"
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
@@ -584,6 +610,7 @@ final class AppModel: ObservableObject {
     @Published var tencentStatusText: String = "未检查"
     @Published var tencentStatusOK = false
     @Published var tencentNickname: String = ""
+    @Published var tencentAccountNameInput: String = ""
     @Published var profileProgress: [String: DownloadTaskProgress] = [:]
     @Published var singleDownloadProgress = SingleDownloadProgress()
     @Published var noticeText: String = ""
@@ -648,6 +675,7 @@ final class AppModel: ObservableObject {
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
         }
         load()
+        migrateLegacyTencentAccount()
         validateBundledRuntime()
         loadPublishHistory()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
@@ -911,6 +939,19 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func choosePublishVideo() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.mpeg4Movie, .movie]
+        if panel.runModal() == .OK, let path = panel.url?.path {
+            config.publish.input_video = path
+            config.publish.input_dir = panel.url?.deletingLastPathComponent().path ?? ""
+            save()
+        }
+    }
+
     func addScheduledDownloadTask(profileID: String, intervalMinutes: Int, activeStart: String, activeEnd: String) {
         guard !profileID.isEmpty else { return }
         config.automation.download_tasks.append(
@@ -1030,6 +1071,15 @@ final class AppModel: ObservableObject {
         openPath(config.download.output_dir)
     }
     func openPublishDirectory() { openPath(config.publish.input_dir) }
+
+    func openPathForPublishVideo() {
+        let path = config.publish.input_video.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else {
+            reportIssue("请先选择视频")
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
 
     var downloadDirectoryReady: Bool {
         let path = config.download.output_dir.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1319,6 +1369,129 @@ final class AppModel: ObservableObject {
         runTencentStatus(arguments: ["app-tencent-setup", "--json"], extraEnvironment: token.isEmpty ? [:] : ["QQ_AI_CONNECT_TOKEN_INPUT": token])
     }
 
+    func addTencentAccount() {
+        let token = tencentTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            reportIssue("请先粘贴频道 Token")
+            return
+        }
+        guard !busy else {
+            reportIssue("已有任务正在运行")
+            return
+        }
+        busy = true
+        tencentStatusText = "正在验证"
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let statusOutput = try self.runTencentCLI(["login", "status", "--json"], token: token)
+                let status = try JSONDecoder().decode(TencentCLIStatus.self, from: Data(statusOutput.utf8))
+                guard status.success && (status.data.valid == true || status.data.isLoggedIn == true) else {
+                    throw NSError(domain: "VideocpStudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "Token 未通过登录验证"])
+                }
+                let userOutput = try self.runTencentCLI(["manage", "get-user-info", "--json"], token: token)
+                let user = try JSONDecoder().decode(TencentCLIUser.self, from: Data(userOutput.utf8))
+                let nickname = user.data.nickname ?? user.data.global_nickname ?? ""
+                let author = user.data.is_guild_author ?? false
+                DispatchQueue.main.async {
+                    let requestedName = self.tencentAccountNameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let account = TencentAccount(
+                        name: requestedName.isEmpty ? nickname : requestedName,
+                        token: token,
+                        nickname: nickname,
+                        is_guild_author: author,
+                        verified: true
+                    )
+                    self.config.tencent_accounts.append(account)
+                    self.config.publish.account_id = account.id
+                    self.tencentTokenInput = ""
+                    self.tencentAccountNameInput = ""
+                    self.tencentStatusOK = true
+                    self.tencentNickname = account.displayName
+                    self.tencentStatusText = "\(account.displayName) · \(author ? "创作者" : "非创作者")"
+                    self.busy = false
+                    self.save()
+                    self.reportInfo("频道账号已添加：\(account.displayName)")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.busy = false
+                    self.tencentStatusOK = false
+                    self.tencentStatusText = "验证失败"
+                    self.reportIssue("频道账号添加失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func deleteTencentAccount(_ account: TencentAccount) {
+        let credential = configURL.deletingLastPathComponent()
+            .appendingPathComponent("accounts")
+            .appendingPathComponent("\(account.id).env")
+        try? FileManager.default.removeItem(at: credential)
+        config.tencent_accounts.removeAll { $0.id == account.id }
+        if config.publish.account_id == account.id {
+            config.publish.account_id = config.tencent_accounts.first?.id ?? ""
+        }
+        for index in config.automation.publish_tasks.indices where config.automation.publish_tasks[index].account_id == account.id {
+            config.automation.publish_tasks[index].account_id = ""
+            config.automation.publish_tasks[index].enabled = false
+        }
+        save()
+        reportInfo("已删除频道账号：\(account.displayName)")
+    }
+
+    func tokenForAccount(_ accountID: String) -> String {
+        if let token = config.tencent_accounts.first(where: { $0.id == accountID })?.token, !token.isEmpty {
+            return token
+        }
+        return legacyTencentToken()
+    }
+
+    private func credentialURL(for accountID: String, token: String) throws -> URL {
+        let directory = configURL.deletingLastPathComponent().appendingPathComponent("accounts", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let safeID = accountID.replacingOccurrences(
+            of: "[^A-Za-z0-9._-]",
+            with: "-",
+            options: .regularExpression
+        )
+        let url = directory.appendingPathComponent("\(safeID).env")
+        try "QQ_AI_CONNECT_TOKEN=\(token)\n".write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return url
+    }
+
+    private func credentialEnvironment(for accountID: String) throws -> [String: String] {
+        let token = tokenForAccount(accountID)
+        guard !token.isEmpty else {
+            throw NSError(domain: "VideocpStudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "频道账号 Token 不存在"])
+        }
+        let url = try credentialURL(for: accountID, token: token)
+        return ["QQ_AI_CONNECT_DOTENV": url.path]
+    }
+
+    private func legacyTencentToken() -> String {
+        let envURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".qqcli/.env")
+        guard let text = try? String(contentsOf: envURL, encoding: .utf8) else { return "" }
+        guard let line = text.split(separator: "\n")
+            .map(String.init)
+            .first(where: { $0.hasPrefix("QQ_AI_CONNECT_TOKEN=") }) else { return "" }
+        return String(line.dropFirst("QQ_AI_CONNECT_TOKEN=".count))
+    }
+
+    private func migrateLegacyTencentAccount() {
+        guard config.tencent_accounts.isEmpty else { return }
+        let token = legacyTencentToken()
+        guard !token.isEmpty else { return }
+        let account = TencentAccount(name: "原有频道账号", token: token, verified: true)
+        config.tencent_accounts = [account]
+        config.publish.account_id = account.id
+        for index in config.automation.publish_tasks.indices where config.automation.publish_tasks[index].account_id.isEmpty {
+            config.automation.publish_tasks[index].account_id = account.id
+        }
+        save()
+    }
+
     func checkTencentChannel(silent: Bool = false) {
         if silent && busy { return }
         suppressNextTencentFailureNotice = silent
@@ -1332,15 +1505,21 @@ final class AppModel: ObservableObject {
             reportIssue("发布任务正在运行，请等待当前任务完成")
             return
         }
-        let directory = config.publish.input_dir.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !directory.isEmpty else {
-            reportIssue("请先选择待发布视频目录")
+        let videoPath = config.publish.input_video.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !videoPath.isEmpty, FileManager.default.isReadableFile(atPath: videoPath) else {
+            reportIssue("请先选择要发布的 MP4 视频")
             return
         }
+        guard !config.publish.account_id.isEmpty, !tokenForAccount(config.publish.account_id).isEmpty else {
+            reportIssue("请先选择一个已验证的频道账号")
+            return
+        }
+        let directory = URL(fileURLWithPath: videoPath).deletingLastPathComponent().path
         appendLog("开始发布")
         let task = ScheduledPublishTask(
             id: "manual",
             directories: [directory],
+            account_id: config.publish.account_id,
             interval_minutes: 1,
             order: "sequential",
             scope: config.publish.scope,
@@ -1355,14 +1534,26 @@ final class AppModel: ObservableObject {
             translate_title_zh_cn: config.publish.translate_title_zh_cn,
             delete_after_publish: config.publish.delete_after_publish
         )
-        runScheduledPublish(task, directory: directory)
+        runScheduledPublish(task, directory: directory, retryVideoPath: videoPath)
     }
 
-    private func runScheduledPublish(_ task: ScheduledPublishTask, directory: String) {
+    private func runScheduledPublish(_ task: ScheduledPublishTask, directory: String, retryVideoPath: String = "") {
         guard publishProcesses[task.id]?.isRunning != true else { return }
+        guard !task.account_id.isEmpty else {
+            reportIssue("发布任务未选择频道账号")
+            return
+        }
+        let token = tokenForAccount(task.account_id)
+        guard !token.isEmpty else {
+            reportIssue("发布任务未选择有效的频道账号")
+            return
+        }
         do {
-            let snapshotURL = try writeScheduledPublishSnapshot(task, directory: directory)
-            let process = makeProcess(arguments: ["app-publish", "--app-config", snapshotURL.path])
+            let snapshotURL = try writeScheduledPublishSnapshot(task, directory: directory, retryVideoPath: retryVideoPath)
+            let process = makeProcess(
+                arguments: ["app-publish", "--app-config", snapshotURL.path],
+                extraEnvironment: try credentialEnvironment(for: task.account_id)
+            )
             publishProcesses[task.id] = process
             publishProcessOutputs[task.id] = ""
             streamScheduledPublish(process, taskID: task.id, snapshotURL: snapshotURL)
@@ -1396,6 +1587,7 @@ final class AppModel: ObservableObject {
             let task = ScheduledPublishTask(
                 id: retryID,
                 directories: [directory],
+                account_id: config.publish.account_id,
                 interval_minutes: 1,
                 order: "sequential",
                 scope: config.publish.scope,
@@ -1411,7 +1603,15 @@ final class AppModel: ObservableObject {
                 delete_after_publish: config.publish.delete_after_publish
             )
             let snapshotURL = try writeScheduledPublishSnapshot(task, directory: directory, retryVideoPath: expanded)
-            let process = makeProcess(arguments: ["app-publish", "--app-config", snapshotURL.path])
+            let token = tokenForAccount(task.account_id)
+            guard !token.isEmpty else {
+                reportIssue("请先选择一个已验证的频道账号")
+                return
+            }
+            let process = makeProcess(
+                arguments: ["app-publish", "--app-config", snapshotURL.path],
+                extraEnvironment: try credentialEnvironment(for: task.account_id)
+            )
             publishProcesses[retryID] = process
             publishProcessOutputs[retryID] = ""
             appendLog("重新发布失败视频: \(expanded)")
@@ -1692,6 +1892,12 @@ final class AppModel: ObservableObject {
             let source = response.token_source.isEmpty ? "未知来源" : response.token_source
             tencentStatusText = "\(name) · \(author)"
             tencentNickname = name
+            if let index = config.tencent_accounts.firstIndex(where: { $0.id == config.publish.account_id }) {
+                config.tencent_accounts[index].nickname = name
+                config.tencent_accounts[index].is_guild_author = response.is_guild_author
+                config.tencent_accounts[index].verified = true
+                save()
+            }
             reportInfo("腾讯频道验证成功，\(greetingText)")
             appendLog("腾讯频道验证成功: \(name), \(author), 来源 \(source)")
         } else {
@@ -1705,7 +1911,7 @@ final class AppModel: ObservableObject {
         suppressNextTencentFailureNotice = false
     }
 
-    private func runTencentCLI(_ arguments: [String]) throws -> String {
+    private func runTencentCLI(_ arguments: [String], token: String = "") throws -> String {
         let bundledBin = Bundle.main.resourceURL?
             .appendingPathComponent("runtime/bin")
             .path ?? ""
@@ -1725,12 +1931,24 @@ final class AppModel: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = "\(bundledBin):/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "")
         environment["VIDEOCP_BUNDLED_BIN"] = bundledBin
+        var temporaryCredentialURL: URL?
+        if !token.isEmpty {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("videocp-account-\(UUID().uuidString).env")
+            try "QQ_AI_CONNECT_TOKEN=\(token)\n".write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            environment["QQ_AI_CONNECT_DOTENV"] = url.path
+            temporaryCredentialURL = url
+        }
         process.environment = environment
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
         try process.run()
         process.waitUntilExit()
+        if let temporaryCredentialURL {
+            try? FileManager.default.removeItem(at: temporaryCredentialURL)
+        }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
@@ -2693,6 +2911,7 @@ struct ContentView: View {
     @State private var scheduleStartDraft = "09:00"
     @State private var scheduleEndDraft = "23:00"
     @State private var schedulePublishDirectoriesDraft: [String] = []
+    @State private var schedulePublishAccountIDDraft = ""
     @State private var schedulePublishOrderDraft = "sequential"
     @State private var schedulePublishScopeDraft = "author_global"
     @State private var schedulePublishGuildIDDraft = ""
@@ -3513,70 +3732,71 @@ struct ContentView: View {
                 titleRow("发布到频道", icon: "paperplane.circle.fill")
                 publishTabs
                 panel {
-                    if model.tencentStatusOK && !showTencentTokenSettings {
-                        HStack(spacing: 10) {
-                            Label(model.tencentStatusText, systemImage: "person.crop.circle.badge.checkmark")
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Label("频道账号", systemImage: "person.crop.circle.badge.checkmark")
                                 .font(.headline)
-                                .foregroundStyle(Color.green)
                             Spacer()
                             Button {
-                                showTencentTokenSettings = true
+                                showTencentTokenSettings.toggle()
                             } label: {
-                                Label("修改 Token", systemImage: "key")
+                                Label(showTencentTokenSettings ? "收起" : "添加账号", systemImage: showTencentTokenSettings ? "chevron.up" : "plus")
                             }
-                            Button {
-                                model.checkTencentChannel()
-                            } label: {
-                                Label("重新检查", systemImage: "checkmark.seal")
-                            }
-                            .disabled(model.busy)
                         }
-                    } else {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Label("频道账号", systemImage: "person.crop.circle.badge.checkmark")
-                                    .font(.headline)
-                                Spacer()
-                                if model.tencentStatusOK {
-                                    Button {
-                                        showTencentTokenSettings = false
+                        if model.config.tencent_accounts.isEmpty {
+                            Text("还没有频道账号，请添加并验证 Token。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(model.config.tencent_accounts) { account in
+                                HStack {
+                                    Image(systemName: account.verified ? "checkmark.seal.fill" : "exclamationmark.triangle")
+                                        .foregroundStyle(account.verified ? Color.green : Color.orange)
+                                    Text(account.displayName).font(.headline)
+                                    Text(account.is_guild_author ? "创作者" : "非创作者")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    if model.config.publish.account_id == account.id {
+                                        statusPill(text: "当前", ok: true)
+                                    }
+                                    Button(role: .destructive) {
+                                        model.deleteTencentAccount(account)
                                     } label: {
-                                        Image(systemName: "xmark")
+                                        Image(systemName: "trash")
                                     }
                                     .buttonStyle(.borderless)
                                 }
                             }
+                        }
+                        if showTencentTokenSettings || model.config.tencent_accounts.isEmpty {
                             HStack(spacing: 5) {
                                 Text("还没有 Token？")
                                     .foregroundStyle(.secondary)
                                 Link("前往腾讯频道开放平台获取", destination: URL(string: "https://connect.qq.com/")!)
                             }
                             .font(.caption)
+                            TextField("账号备注，例如：全球视频精选", text: $model.tencentAccountNameInput)
+                                .textFieldStyle(.roundedBorder)
                             SecureField("粘贴 QQ_AI_CONNECT_TOKEN，用于保存或更新本机登录凭证", text: $model.tencentTokenInput)
                                 .textFieldStyle(.roundedBorder)
                             HStack(spacing: 10) {
                                 Button {
-                                    model.setupTencentChannel()
-                                    if !model.tencentTokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        showTencentTokenSettings = false
-                                    }
+                                    model.addTencentAccount()
                                 } label: {
-                                    Label("保存 / 更新 Token", systemImage: "key")
-                                }
-                                Button { model.checkTencentChannel() } label: {
-                                    Label("检查登录", systemImage: "checkmark.seal")
+                                    Label("验证并添加账号", systemImage: "person.crop.circle.badge.plus")
                                 }
                                 .disabled(model.busy)
                                 statusPill(text: model.tencentStatusText, ok: model.tencentStatusOK)
                                 Spacer()
                             }
-                            Text("保存 / 更新 Token 会把你粘贴的 Token 写入本机凭证；检查登录只验证当前凭证是否可用。")
+                            Text("Token 仅保存在本机配置中；每个发布任务会使用自己选择的账号。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
                 }
-                if model.tencentStatusOK || publishMode == .history {
+                if !model.config.tencent_accounts.isEmpty || publishMode == .history {
                     switch publishMode {
                     case .single:
                         singlePublishPanel
@@ -3631,13 +3851,25 @@ struct ContentView: View {
                 Label("视频来源", systemImage: "folder.fill")
                     .font(.headline)
                 HStack(spacing: 12) {
-                    field("mp4 目录", text: $model.config.publish.input_dir)
-                    Button { model.choosePublishDirectory() } label: {
-                        Label("选择", systemImage: "folder")
+                    field("MP4 视频", text: $model.config.publish.input_video)
+                    Button { model.choosePublishVideo() } label: {
+                        Label("选择视频", systemImage: "film")
                     }
-                    Button { model.openPublishDirectory() } label: {
+                    Button { model.openPathForPublishVideo() } label: {
                         Image(systemName: "arrow.up.right.square")
                     }
+                }
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("发布账号").font(.caption).foregroundStyle(.secondary)
+                        Picker("", selection: $model.config.publish.account_id) {
+                            ForEach(model.config.tencent_accounts) { account in
+                                Text(account.displayName).tag(account.id)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                    Spacer()
                 }
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 5) {
@@ -3648,7 +3880,6 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                     }
-                    intField("每次发布", value: $model.config.publish.limit)
                     VStack(alignment: .leading, spacing: 5) {
                         Text("帖子类型").font(.caption).foregroundStyle(.secondary)
                         Picker("", selection: $model.config.publish.feed_type) {
@@ -3870,6 +4101,9 @@ struct ContentView: View {
                             Text("\(task.order == "random" ? "随机发布" : "顺序发布") · 每 \(task.interval_minutes) 分钟执行")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            Text("账号：\(model.config.tencent_accounts.first(where: { $0.id == task.account_id })?.displayName ?? "未选择")")
+                                .font(.caption2)
+                                .foregroundStyle(task.account_id.isEmpty ? Color.orange : .secondary)
                             Text([
                                 task.scope == "channel" ? "频道内" : "创作者全局",
                                 task.feed_type == 2 ? "长帖" : "短帖",
@@ -4020,6 +4254,7 @@ struct ContentView: View {
     }
 
     private func loadPublishScheduleSettings(from settings: PublishSettings) {
+        schedulePublishAccountIDDraft = settings.account_id
         schedulePublishScopeDraft = settings.scope
         schedulePublishGuildIDDraft = settings.guild_id
         schedulePublishChannelIDDraft = settings.channel_id
@@ -4034,6 +4269,7 @@ struct ContentView: View {
     }
 
     private func loadPublishScheduleSettings(from task: ScheduledPublishTask) {
+        schedulePublishAccountIDDraft = task.account_id
         schedulePublishScopeDraft = task.scope
         schedulePublishGuildIDDraft = task.guild_id
         schedulePublishChannelIDDraft = task.channel_id
@@ -4051,6 +4287,7 @@ struct ContentView: View {
         ScheduledPublishTask(
             id: id,
             directories: schedulePublishDirectoriesDraft,
+            account_id: schedulePublishAccountIDDraft,
             interval_minutes: scheduleIntervalDraft,
             order: schedulePublishOrderDraft,
             enabled: enabled,
@@ -4129,6 +4366,16 @@ struct ContentView: View {
 
                     panel {
                         Text("发布位置与帖子").font(.headline)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("发布账号").font(.caption).foregroundStyle(.secondary)
+                            Picker("", selection: $schedulePublishAccountIDDraft) {
+                                Text("请选择账号").tag("")
+                                ForEach(model.config.tencent_accounts) { account in
+                                    Text(account.displayName).tag(account.id)
+                                }
+                            }
+                            .labelsHidden()
+                        }
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 5) {
                                 Text("发布范围").font(.caption).foregroundStyle(.secondary)
@@ -4189,6 +4436,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(
                     schedulePublishDirectoriesDraft.isEmpty
+                        || schedulePublishAccountIDDraft.isEmpty
                         || schedulePublishLimitDraft < 1
                         || (schedulePublishScopeDraft == "channel"
                             && (schedulePublishGuildIDDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

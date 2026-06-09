@@ -13,8 +13,10 @@ from videocp.errors import PublishError
 from videocp.runtime_log import log_info
 
 
-MAX_CHANNEL_VIDEO_BYTES = int(3.5 * 1024 * 1024 * 1024)
-TARGET_CHANNEL_VIDEO_BYTES = int(3.25 * 1024 * 1024 * 1024)
+# Tencent's slice initializer rejects files well below 4 GiB on some accounts.
+# Keep the output below 2 GiB with enough room for container-size variance.
+MAX_CHANNEL_VIDEO_BYTES = int(1.9 * 1024 * 1024 * 1024)
+TARGET_CHANNEL_VIDEO_BYTES = int(1.75 * 1024 * 1024 * 1024)
 
 
 @dataclass(slots=True)
