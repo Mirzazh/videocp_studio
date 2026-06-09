@@ -165,7 +165,13 @@ def _youtube_continuation_token(data: dict[str, Any], *, popular_chip: bool) -> 
     for item in _walk_json(data):
         if popular_chip:
             chip = item.get("chipViewModel")
-            if not isinstance(chip, dict) or str(chip.get("text", "")).lower() not in {"popular", "热门"}:
+            if not isinstance(chip, dict):
+                continue
+            labels = {
+                str(chip.get("text", "")).strip().lower(),
+                str(chip.get("accessibilityLabel", "")).strip().lower(),
+            }
+            if not labels.intersection({"popular", "热门", "最热门", "熱門", "最熱門"}):
                 continue
             command = chip.get("tapCommand", {}).get("innertubeCommand", {})
         else:

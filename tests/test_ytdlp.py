@@ -437,6 +437,22 @@ def test_expand_ytdlp_playlist_uses_youtube_popular_filter(monkeypatch):
     assert result.video_urls == ["https://www.youtube.com/watch?v=popular"]
 
 
+def test_youtube_popular_filter_accepts_localized_label():
+    data = {
+        "chipViewModel": {
+            "text": "最热门",
+            "accessibilityLabel": "最热门",
+            "tapCommand": {
+                "innertubeCommand": {
+                    "continuationCommand": {"token": "popular-token"},
+                },
+            },
+        },
+    }
+
+    assert ytdlp._youtube_continuation_token(data, popular_chip=True) == "popular-token"
+
+
 def test_expand_bilibili_playlist_requests_click_order_for_popular(monkeypatch):
     commands = []
 
