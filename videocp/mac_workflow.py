@@ -16,7 +16,14 @@ from videocp.config import AppConfig, WatermarkConfig, load_app_config
 from videocp.mac_scheduler import ensure_app_config, resolve_config_path
 from videocp.profile import default_profile_dir, detect_system_browser_executable
 from videocp.profile_expander import expand_profile
-from videocp.publisher import PublishResult, check_tencent_login_status, is_login_state_publish_error, publish_to_channel
+from videocp.publisher import (
+    PublishResult,
+    check_tencent_login_status,
+    is_login_state_publish_error,
+    is_retryable_publish_error,
+    prepare_video_for_channel,
+    publish_to_channel,
+)
 from videocp.runtime_log import log_warn
 from videocp.sync_history import SyncHistoryEntry, add_entry, find_processed_entry, load_history, replace_entry
 from videocp.ytdlp import YtdlpPlaylistResult, expand_ytdlp_playlist
@@ -546,35 +553,48 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
         }
         title = _remove_title_exclusions(_format_template(title_template, values), title_exclusions)
         content = _format_template(content_template, values)
-        result = None
-        for attempt in range(retry_count + 1):
-            try:
-                result = publish_to_channel(
-                    skill_dir=skill_dir,
-                    video_path=video_path,
-                    guild_id=guild_id,
-                    channel_id=channel_id,
-                    title=title,
-                    content=content,
-                    feed_type=feed_type,
-                )
-            except Exception as exc:
-                result = PublishResult(success=False, error=str(exc))
-            if result.success:
-                break
-            if attempt < retry_count:
-                log_warn(
-                    "publish.retry",
-                    content_id=content_id,
-                    attempt=attempt + 1,
-                    max_attempts=retry_count + 1,
-                    error=result.error,
-                )
-                if is_login_state_publish_error(result.error):
-                    status = check_tencent_login_status()
-                    if not status.success:
-                        log_warn("publish.login_status_check_failed", content_id=content_id, error=status.error)
-                time.sleep(min(2 ** attempt, 8))
+        try:
+            upload_video_path, remove_upload_copy = prepare_video_for_channel(video_path)
+        except Exception as exc:
+            result = PublishResult(success=False, error=str(exc))
+            upload_video_path = video_path
+            remove_upload_copy = False
+        else:
+            result = None
+        try:
+            if result is None:
+                for attempt in range(retry_count + 1):
+                    try:
+                        result = publish_to_channel(
+                            skill_dir=skill_dir,
+                            video_path=upload_video_path,
+                            guild_id=guild_id,
+                            channel_id=channel_id,
+                            title=title,
+                            content=content,
+                            feed_type=feed_type,
+                            timeout_secs=max(300, min(3600, int(upload_video_path.stat().st_size / 1024 ** 2 * 2))),
+                        )
+                    except Exception as exc:
+                        result = PublishResult(success=False, error=str(exc))
+                    if result.success or not is_retryable_publish_error(result.error):
+                        break
+                    if attempt < retry_count:
+                        log_warn(
+                            "publish.retry",
+                            content_id=content_id,
+                            attempt=attempt + 1,
+                            max_attempts=retry_count + 1,
+                            error=result.error,
+                        )
+                        if is_login_state_publish_error(result.error):
+                            status = check_tencent_login_status()
+                            if not status.success:
+                                log_warn("publish.login_status_check_failed", content_id=content_id, error=status.error)
+                        time.sleep(min(2 ** attempt, 8))
+        finally:
+            if remove_upload_copy:
+                upload_video_path.unlink(missing_ok=True)
         if result.success and not str(result.share_url or "").strip():
             result = PublishResult(
                 success=False,

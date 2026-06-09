@@ -5,7 +5,14 @@ from types import SimpleNamespace
 import pytest
 
 from videocp.errors import PublishError
-from videocp.publisher import _find_ffmpeg, _find_tencent_channel_cli, publish_to_channel
+from videocp.publisher import (
+    MAX_CHANNEL_VIDEO_BYTES,
+    _find_ffmpeg,
+    _find_tencent_channel_cli,
+    is_retryable_publish_error,
+    prepare_video_for_channel,
+    publish_to_channel,
+)
 
 
 def test_publish_to_channel_uses_author_scope_when_ids_are_blank(tmp_path: Path, monkeypatch):
@@ -267,3 +274,32 @@ def test_publish_finds_bundled_cli_and_ffmpeg_before_system_paths(tmp_path: Path
 
     assert _find_tencent_channel_cli() == str(bundled_cli)
     assert _find_ffmpeg() == str(bundled_ffmpeg)
+
+
+def test_prepare_video_for_channel_compresses_oversized_video(tmp_path: Path, monkeypatch):
+    video_path = tmp_path / "large.mp4"
+    with video_path.open("wb") as file:
+        file.truncate(MAX_CHANNEL_VIDEO_BYTES + 1)
+
+    monkeypatch.setattr("videocp.publisher._find_ffmpeg", lambda: "/bin/ffmpeg")
+    monkeypatch.setattr("videocp.publisher._find_ffprobe", lambda: "/bin/ffprobe")
+
+    def fake_run(command, **kwargs):
+        if command[0] == "/bin/ffprobe":
+            return SimpleNamespace(returncode=0, stdout="1000\n", stderr="")
+        output = Path(command[-1])
+        output.write_bytes(b"compressed")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("videocp.publisher.subprocess_run", fake_run)
+
+    prepared, temporary = prepare_video_for_channel(video_path)
+
+    assert temporary is True
+    assert prepared.name == "large.upload.mp4"
+    assert prepared.read_bytes() == b"compressed"
+
+
+def test_filesize_publish_error_is_not_retryable():
+    assert is_retryable_publish_error("init slice failed: filesize is too big or invalid") is False
+    assert is_retryable_publish_error("temporary network timeout") is True

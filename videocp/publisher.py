@@ -4,11 +4,17 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import run as subprocess_run
 
 from videocp.errors import PublishError
+from videocp.runtime_log import log_info
+
+
+MAX_CHANNEL_VIDEO_BYTES = int(3.5 * 1024 * 1024 * 1024)
+TARGET_CHANNEL_VIDEO_BYTES = int(3.25 * 1024 * 1024 * 1024)
 
 
 @dataclass(slots=True)
@@ -53,6 +59,123 @@ def _find_ffmpeg() -> str:
         if candidate and Path(candidate).is_file():
             return candidate
     return ""
+
+
+def _find_ffprobe() -> str:
+    bundled_bin = os.environ.get("VIDEOCP_BUNDLED_BIN", "")
+    candidates = [
+        str(Path(bundled_bin) / "ffprobe") if bundled_bin else "",
+        shutil.which("ffprobe"),
+        "/opt/homebrew/bin/ffprobe",
+        "/usr/local/bin/ffprobe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def prepare_video_for_channel(video_path: Path) -> tuple[Path, bool]:
+    """Return an upload-safe video, transcoding oversized files when needed."""
+    video_path = video_path.resolve()
+    size = video_path.stat().st_size
+    if size <= MAX_CHANNEL_VIDEO_BYTES:
+        return video_path, False
+
+    ffmpeg = _find_ffmpeg()
+    ffprobe = _find_ffprobe()
+    if not ffmpeg or not ffprobe:
+        raise PublishError(
+            f"视频大小为 {size / 1024 ** 3:.2f} GB，超过频道上传安全上限；"
+            "App 未找到内置 ffmpeg/ffprobe，无法自动压缩。"
+        )
+    probe = subprocess_run(
+        [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_publish_env(),
+    )
+    try:
+        duration = float((probe.stdout or "").strip())
+    except ValueError as exc:
+        raise PublishError("无法读取超大视频时长，不能安全压缩后上传。") from exc
+    if probe.returncode != 0 or duration <= 0:
+        raise PublishError("无法读取超大视频时长，不能安全压缩后上传。")
+
+    audio_bitrate = 128_000
+    total_bitrate = int(TARGET_CHANNEL_VIDEO_BYTES * 8 / duration)
+    video_bitrate = max(350_000, total_bitrate - audio_bitrate)
+    temp_dir = Path(tempfile.gettempdir()) / "videocp-publish"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    output_path = temp_dir / f"{video_path.stem}.upload.mp4"
+    output_path.unlink(missing_ok=True)
+    log_info(
+        "publish.video.compress.start",
+        input=str(video_path),
+        output=str(output_path),
+        input_bytes=size,
+        target_bytes=TARGET_CHANNEL_VIDEO_BYTES,
+        duration_secs=round(duration, 1),
+    )
+    proc = subprocess_run(
+        [
+            ffmpeg,
+            "-y",
+            "-loglevel", "error",
+            "-i", str(video_path),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-b:v", str(video_bitrate),
+            "-maxrate", str(int(video_bitrate * 1.12)),
+            "-bufsize", str(video_bitrate * 2),
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=max(1800, int(duration * 2)),
+        env=_publish_env(),
+    )
+    if proc.returncode != 0 or not output_path.is_file():
+        output_path.unlink(missing_ok=True)
+        error = (proc.stderr or "").strip()[-600:]
+        raise PublishError(f"超大视频自动压缩失败: {error or f'ffmpeg exit {proc.returncode}'}")
+    output_size = output_path.stat().st_size
+    if output_size > MAX_CHANNEL_VIDEO_BYTES:
+        output_path.unlink(missing_ok=True)
+        raise PublishError(
+            f"自动压缩后文件仍有 {output_size / 1024 ** 3:.2f} GB，超过频道上传上限。"
+        )
+    log_info(
+        "publish.video.compress.complete",
+        output=str(output_path),
+        output_bytes=output_size,
+    )
+    return output_path, True
+
+
+def is_retryable_publish_error(error: str) -> bool:
+    value = str(error or "").lower()
+    permanent_markers = [
+        "filesize is too big",
+        "file size is too big",
+        "文件过大",
+        "超过频道上传",
+        "格式无效",
+        "invalid filesize",
+    ]
+    return not any(marker in value for marker in permanent_markers)
 
 
 def _publish_env() -> dict[str, str]:
