@@ -4,6 +4,16 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
+private let appVersion = "1.1.1"
+private let appReleaseAPIURL = URL(string: "https://api.github.com/repos/Mirzazh/videocp_studio/releases/latest")!
+private let appReleasePageURL = URL(string: "https://github.com/Mirzazh/videocp_studio/releases/latest")!
+
+struct GitHubReleaseResponse: Codable {
+    var tag_name: String
+    var html_url: String
+    var name: String?
+}
+
 struct SchedulerConfig: Codable {
     var tasks_file: String = "mac-tasks.yaml"
     var run_interval_minutes: Int = 60
@@ -576,6 +586,11 @@ final class AppModel: ObservableObject {
     @Published var youtubeCookieStatusText: String = ""
     @Published var schedulerNow = Date()
     @Published var historyRedownloadStatus: [String: String] = [:]
+    @Published var updateStatusText: String = "未检查更新"
+    @Published var updateAvailable = false
+    @Published var latestVersion: String = ""
+    @Published var latestReleaseURL: URL = appReleasePageURL
+    @Published var checkingUpdate = false
 
     let appRoot: URL
     let configURL: URL
@@ -597,6 +612,7 @@ final class AppModel: ObservableObject {
     private var historyRedownloadProcesses: [String: Process] = [:]
     private var historyRedownloadOutputs: [String: String] = [:]
     private var suppressNextTencentFailureNotice = false
+    private var didAutoCheckUpdate = false
     private var logLines: [String] = []
     private let maxVisibleLogLines = 100
     private let maxVisibleLogLineLength = 1200
@@ -630,6 +646,9 @@ final class AppModel: ObservableObject {
         loadPublishHistory()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
             self?.checkTencentChannel(silent: true)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.checkForUpdates(silent: true)
         }
     }
 
@@ -755,6 +774,90 @@ final class AppModel: ObservableObject {
 
     func dismissNotice() {
         noticeText = ""
+    }
+
+    func checkForUpdates(silent: Bool = false) {
+        if silent && didAutoCheckUpdate { return }
+        if silent { didAutoCheckUpdate = true }
+        guard !checkingUpdate else { return }
+        checkingUpdate = true
+        updateStatusText = "正在检查更新"
+
+        var request = URLRequest(url: appReleaseAPIURL)
+        request.timeoutInterval = 12
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("Videocp-Studio/\(appVersion)", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checkingUpdate = false
+                if let error {
+                    self.updateStatusText = "检查更新失败"
+                    if !silent {
+                        self.reportIssue("检查更新失败：\(error.localizedDescription)")
+                    }
+                    return
+                }
+                guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                      let data,
+                      let release = try? JSONDecoder().decode(GitHubReleaseResponse.self, from: data) else {
+                    self.updateStatusText = "检查更新失败"
+                    if !silent {
+                        self.reportIssue("检查更新失败：无法读取 GitHub Release 信息")
+                    }
+                    return
+                }
+
+                let latest = release.tag_name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalizedLatest = self.normalizedVersion(latest)
+                self.latestVersion = normalizedLatest
+                self.latestReleaseURL = URL(string: release.html_url) ?? appReleasePageURL
+
+                if self.isVersion(normalizedLatest, newerThan: appVersion) {
+                    self.updateAvailable = true
+                    self.updateStatusText = "发现新版本 \(normalizedLatest)"
+                    self.reportInfo("发现新版本 \(normalizedLatest)，可以点击“打开更新”下载。")
+                } else {
+                    self.updateAvailable = false
+                    self.updateStatusText = "已是最新版"
+                    if !silent {
+                        self.reportInfo("当前已是最新版 \(appVersion)")
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    func openLatestRelease() {
+        NSWorkspace.shared.open(latestReleaseURL)
+    }
+
+    private func normalizedVersion(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+    }
+
+    private func isVersion(_ candidate: String, newerThan current: String) -> Bool {
+        let left = versionParts(candidate)
+        let right = versionParts(current)
+        for index in 0..<max(left.count, right.count) {
+            let lvalue = index < left.count ? left[index] : 0
+            let rvalue = index < right.count ? right[index] : 0
+            if lvalue != rvalue {
+                return lvalue > rvalue
+            }
+        }
+        return false
+    }
+
+    private func versionParts(_ value: String) -> [Int] {
+        normalizedVersion(value)
+            .split(separator: ".")
+            .map { part in
+                let digits = part.prefix { $0.isNumber }
+                return Int(digits) ?? 0
+            }
     }
 
     func chooseDownloadDirectory() {
@@ -2289,9 +2392,17 @@ final class AppModel: ObservableObject {
         historyRedownloadProcesses[entry.id]?.isRunning == true
     }
 
+    var hasActiveHistoryRedownload: Bool {
+        historyRedownloadProcesses.values.contains { $0.isRunning }
+    }
+
     func redownloadHistoryEntry(_ entry: DownloadHistoryEntry, profile: DownloadProfile) {
         guard requireDownloadDirectory() else { return }
         guard !isHistoryRedownloading(entry) else { return }
+        guard !hasActiveHistoryRedownload else {
+            reportIssue("已有视频正在重新下载，请等当前任务完成后再点下一条")
+            return
+        }
         guard let sourceURL = downloadSourceURL(for: entry) else {
             historyRedownloadStatus[entry.id] = "缺少原视频链接"
             reportIssue("无法还原这条记录的原视频链接")
@@ -2646,7 +2757,34 @@ struct ContentView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Color.accentColor)
             }
-            Text("v1.1.0")
+            if model.updateAvailable {
+                Label(model.updateStatusText, systemImage: "arrow.down.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.orange.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                Button {
+                    model.openLatestRelease()
+                } label: {
+                    Label("打开更新", systemImage: "safari")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.orange)
+            } else {
+                Button {
+                    model.checkForUpdates()
+                } label: {
+                    Label(model.checkingUpdate ? "检查中" : "检查更新", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .disabled(model.checkingUpdate)
+                .help(model.updateStatusText)
+            }
+            Text("v\(appVersion)")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 8)
@@ -3312,6 +3450,7 @@ struct ContentView: View {
                                             Image(systemName: "arrow.clockwise")
                                         }
                                         .buttonStyle(.borderless)
+                                        .disabled(model.hasActiveHistoryRedownload)
                                         .help("按当前清晰度重新下载")
                                     }
                                     Button {

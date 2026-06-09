@@ -45,6 +45,11 @@ YOUTUBE_COOKIE_HELP = (
 )
 YTDLP_DOWNLOAD_TIMEOUT_SECS = 300
 YOUTUBE_LOW_FORMAT_FALLBACK_ARGS = "youtube:player_client=web_safari"
+YOUTUBE_DOWNLOAD_RETRY_ARGS = (
+    "youtube:player_client=web_safari",
+    "youtube:player_client=mweb;fetch_pot=always",
+    "youtube:player_client=tv",
+)
 
 
 @dataclass(slots=True)
@@ -212,13 +217,53 @@ def _is_timeout_error(error: object) -> bool:
 
 
 def _youtube_error_message(exc: object) -> str:
+    normalized = str(exc or "").lower()
     if _is_timeout_error(exc):
         return (
             "YouTube 下载超时：网络较慢、视频较大或 YouTube 响应太慢。"
             "App 已把下载超时提升到 5 分钟；如果仍失败，请稍后重试、换网络，或确认 Cookie 没有过期。"
             f" 原始错误: {exc}"
         )
+    if "http error 403" in normalized or "forbidden" in normalized:
+        return (
+            "YouTube 临时拒绝了视频流下载：这通常是并发下载过多、视频链接令牌过期或 Cookie/PO Token 短暂失效。"
+            "App 已自动重试；如果仍失败，请减少同时重新下载数量，稍后重试，或重新粘贴 Cookie。"
+            f" 原始错误: {exc}"
+        )
+    if "youtube 下载队列等待超时" in str(exc or ""):
+        return str(exc)
     return f"{YOUTUBE_COOKIE_HELP} 原始错误: {exc}"
+
+
+def _is_youtube_forbidden_error(error: object) -> bool:
+    normalized = str(error or "").lower()
+    return "http error 403" in normalized or "forbidden" in normalized
+
+
+def _cleanup_ytdlp_partial_files(path: Path) -> None:
+    parent = path.parent
+    if not parent.exists():
+        return
+    stem = path.stem
+    for candidate in parent.glob(f"{stem}*"):
+        if candidate.suffix == ".json":
+            continue
+        try:
+            if candidate.is_file():
+                candidate.unlink()
+        except OSError:
+            pass
+
+
+def _youtube_download_extractor_candidates(primary: str) -> list[str]:
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for value in [primary, *YOUTUBE_DOWNLOAD_RETRY_ARGS]:
+        cleaned = str(value or "").strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            candidates.append(cleaned)
+    return candidates
 
 
 class StartIntervalGate:
@@ -418,14 +463,47 @@ def _expand_profile_inputs(
                             ))
                         continue
                     raise
-                for url in result.video_urls:
+                result_urls = result.video_urls
+                result_author = result.uploader
+                if (
+                    "space.bilibili.com" in profile_input.canonical_url.lower()
+                    and len(result_urls) < profile_videos_count
+                ):
+                    log_warn(
+                        "profile.expand.bilibili_short_result",
+                        requested=profile_videos_count,
+                        received=len(result_urls),
+                        message="B站接口只返回了部分视频，继续使用浏览器分页补齐",
+                    )
+                    separator = "&" if "?" in profile_input.canonical_url else "?"
+                    browser_profile_url = (
+                        f"{profile_input.canonical_url}{separator}order="
+                        f"{'click' if profile_order == 'popular' else 'pubdate'}"
+                    )
+                    with open_download_browser_session(browser_config) as browser:
+                        page = browser.new_page()
+                        try:
+                            native_result = expand_profile(
+                                page=page,
+                                profile_url=browser_profile_url,
+                                max_videos=profile_videos_count,
+                                timeout_secs=timeout_secs,
+                            )
+                        finally:
+                            page.close()
+                    result_urls = list(dict.fromkeys([
+                        *result_urls,
+                        *native_result.video_urls,
+                    ]))[:profile_videos_count]
+                    result_author = result_author or native_result.author
+                for url in result_urls:
                     provider_key = "bilibili" if "bilibili.com/video/" in url.lower() else "ytdlp"
                     expanded.append(ParsedInput(
                         raw_input=url,
                         extracted_url=url,
                         canonical_url=url,
                         provider_key=provider_key,
-                        author_hint=result.uploader,
+                        author_hint=result_author,
                     ))
 
     log_info("profile.expand.batch_complete", expanded=len(expanded))
@@ -598,20 +676,37 @@ def _download_ytdlp_input(
     sidecar_path = output_path.with_suffix(".json")
 
     # Download
-    try:
-        download_with_ytdlp(
-            url=parsed.canonical_url,
-            output_path=download_path,
-            cookies_file=cookies_file,
-            timeout_secs=max(timeout_secs, YTDLP_DOWNLOAD_TIMEOUT_SECS),
-            extractor_args=effective_extractor_args,
-            remote_components=remote_components,
-            quality=quality,
-        )
-    except DownloadError as exc:
-        if is_youtube_url:
-            raise DownloadError(_youtube_error_message(exc)) from exc
-        raise
+    download_attempt_errors: list[str] = []
+    extractor_candidates = (
+        _youtube_download_extractor_candidates(effective_extractor_args)
+        if is_youtube_url else [effective_extractor_args]
+    )
+    for attempt_index, attempt_extractor_args in enumerate(extractor_candidates, start=1):
+        try:
+            download_with_ytdlp(
+                url=parsed.canonical_url,
+                output_path=download_path,
+                cookies_file=cookies_file,
+                timeout_secs=max(timeout_secs, YTDLP_DOWNLOAD_TIMEOUT_SECS),
+                extractor_args=attempt_extractor_args,
+                remote_components=remote_components,
+                quality=quality,
+            )
+            effective_extractor_args = attempt_extractor_args
+            break
+        except DownloadError as exc:
+            download_attempt_errors.append(str(exc))
+            if not is_youtube_url or not _is_youtube_forbidden_error(exc) or attempt_index == len(extractor_candidates):
+                if is_youtube_url:
+                    raise DownloadError(_youtube_error_message(exc)) from exc
+                raise
+            _cleanup_ytdlp_partial_files(download_path)
+            log_warn(
+                "ytdlp.download.forbidden_retry",
+                attempt=attempt_index,
+                next_extractor_args=extractor_candidates[attempt_index],
+                error=str(exc),
+            )
     if download_path != output_path:
         download_path.replace(output_path)
 
@@ -643,6 +738,8 @@ def _download_ytdlp_input(
             "download_quality": quality,
             "video_width": width,
             "video_height": height,
+            "ytdlp_extractor_args": effective_extractor_args,
+            "download_attempt_errors": download_attempt_errors,
         },
         "attempts": [{"url": parsed.canonical_url, "mode": "ytdlp", "status": "ok"}],
     }

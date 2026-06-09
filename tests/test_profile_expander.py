@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from videocp.errors import DownloadError
-from videocp.profile_expander import _expand_xiaohongshu_profile
+from videocp.profile_expander import _bilibili_video_page_url, _expand_xiaohongshu_profile
 
 
 class FakeXhsPage:
@@ -44,6 +44,15 @@ class FakeXhsPage:
 
     def query_selector(self, selector):
         return None
+
+
+def test_bilibili_page_url_preserves_order_and_sets_page_number():
+    result = _bilibili_video_page_url(
+        "https://space.bilibili.com/7612168/video?order=click",
+        3,
+    )
+
+    assert result == "https://space.bilibili.com/7612168/video?order=click&pn=3"
 
 
 def test_xiaohongshu_profile_waits_for_login_then_continues():

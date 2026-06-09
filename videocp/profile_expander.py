@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from urllib.parse import urlencode, urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from playwright.sync_api import Page, Response
 
@@ -24,6 +24,17 @@ BILIBILI_BVID_RE = re.compile(r'/(BV[A-Za-z0-9]+)')
 BILIBILI_SPACE_VIDEO_SUFFIX = "/video"
 XHS_EXPLORE_URL_TEMPLATE = "https://www.xiaohongshu.com/explore/{note_id}"
 XHS_NOTE_LINK_RE = re.compile(r'/(?:explore|discovery/item)/([A-Za-z0-9]+)')
+
+
+def _bilibili_video_page_url(profile_url: str, page_number: int) -> str:
+    parsed = urlparse(profile_url)
+    path = parsed.path.rstrip("/")
+    if not path.endswith(BILIBILI_SPACE_VIDEO_SUFFIX):
+        path += BILIBILI_SPACE_VIDEO_SUFFIX
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["pn"] = str(max(1, page_number))
+    query.setdefault("order", "pubdate")
+    return urlunparse(parsed._replace(path=path, query=urlencode(query)))
 
 
 def _extract_author_from_dom(page: Page, selectors: list[str]) -> str:
@@ -268,10 +279,9 @@ def _expand_bilibili_profile(
 
     page.on("response", on_response)
 
-    # Navigate to /video tab for chronological listing
-    video_tab_url = profile_url.rstrip("/")
-    if not video_tab_url.endswith("/video"):
-        video_tab_url += BILIBILI_SPACE_VIDEO_SUFFIX
+    # Navigate to the first explicit page. Building this through the same URL
+    # helper avoids malformed URLs when the profile already contains a query.
+    video_tab_url = _bilibili_video_page_url(profile_url, 1)
     log_info("profile.expand.start", site="bilibili", url=full_url(video_tab_url), max_videos=max_videos)
 
     try:
@@ -287,25 +297,15 @@ def _expand_bilibili_profile(
 
     page.wait_for_timeout(3000)
 
-    # Scroll to load more videos if we don't have enough
-    scroll_attempts = 0
-    max_scroll_attempts = 5
-    while len(collected_bvids) < max_videos and scroll_attempts < max_scroll_attempts:
-        prev_count = len(collected_bvids)
-        page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-        page.wait_for_timeout(2000)
-        if len(collected_bvids) == prev_count:
-            scroll_attempts += 1
-        else:
-            scroll_attempts = 0
-
-    # Fallback: extract video links from the DOM
-    if not collected_bvids:
-        log_info("profile.expand.fallback_dom", site="bilibili")
-        hrefs = page.eval_on_selector_all(
-            'a[href*="/video/BV"]',
-            "els => els.map(e => e.getAttribute('href'))",
-        )
+    def collect_from_dom() -> int:
+        before = len(collected_bvids)
+        try:
+            hrefs = page.eval_on_selector_all(
+                'a[href*="/video/BV"]',
+                "els => els.map(e => e.getAttribute('href'))",
+            )
+        except Exception:
+            hrefs = []
         for href in hrefs:
             if not isinstance(href, str):
                 continue
@@ -315,6 +315,51 @@ def _expand_bilibili_profile(
                 if bvid not in seen_bvids:
                     seen_bvids.add(bvid)
                     collected_bvids.append(bvid)
+        return len(collected_bvids) - before
+
+    collect_from_dom()
+
+    # Scroll first in case the current Bilibili layout lazy-loads cards.
+    scroll_attempts = 0
+    max_scroll_attempts = 5
+    while len(collected_bvids) < max_videos and scroll_attempts < max_scroll_attempts:
+        prev_count = len(collected_bvids)
+        page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+        page.wait_for_timeout(2000)
+        collect_from_dom()
+        if len(collected_bvids) == prev_count:
+            scroll_attempts += 1
+        else:
+            scroll_attempts = 0
+
+    # Bilibili space pages are paginated rather than infinitely scrolling.
+    # Navigate explicit page numbers when the first page does not satisfy the
+    # requested count. This also avoids repeatedly hitting the guarded WBI API.
+    page_number = 2
+    max_page_number = max(2, (max_videos + 24) // 25 + 1)
+    while len(collected_bvids) < max_videos and page_number <= max_page_number:
+        before = len(collected_bvids)
+        page_url = _bilibili_video_page_url(profile_url, page_number)
+        log_info(
+            "profile.expand.bilibili_page",
+            page=page_number,
+            collected=before,
+            url=full_url(page_url),
+        )
+        try:
+            page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_secs * 1000)
+            page.wait_for_timeout(2000)
+            collect_from_dom()
+        except Exception as exc:
+            log_warn(
+                "profile.expand.bilibili_page_failed",
+                page=page_number,
+                error=str(exc),
+            )
+            break
+        if len(collected_bvids) == before:
+            break
+        page_number += 1
 
     video_urls = [
         BILIBILI_VIDEO_URL_TEMPLATE.format(bvid=bvid)
