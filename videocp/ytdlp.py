@@ -8,11 +8,13 @@ import sys
 import tempfile
 import time
 import fcntl
+import http.cookiejar
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from videocp.errors import DownloadError
 from videocp.runtime_log import full_url, log_info, log_warn
@@ -138,6 +140,140 @@ class YtdlpPlaylistResult:
     uploader: str
 
 
+def _walk_json(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json(child)
+
+
+def _youtube_initial_data(html: str) -> dict[str, Any]:
+    marker_match = re.search(r"(?:var ytInitialData = |window\[\"ytInitialData\"\] = )", html)
+    if not marker_match:
+        raise DownloadError("YouTube channel page did not contain initial data")
+    try:
+        data, _ = json.JSONDecoder().raw_decode(html[marker_match.end():])
+    except json.JSONDecodeError as exc:
+        raise DownloadError("YouTube channel page returned invalid initial data") from exc
+    return data
+
+
+def _youtube_continuation_token(data: dict[str, Any], *, popular_chip: bool) -> str:
+    for item in _walk_json(data):
+        if popular_chip:
+            chip = item.get("chipViewModel")
+            if not isinstance(chip, dict) or str(chip.get("text", "")).lower() not in {"popular", "热门"}:
+                continue
+            command = chip.get("tapCommand", {}).get("innertubeCommand", {})
+        else:
+            continuation = item.get("continuationItemRenderer")
+            if not isinstance(continuation, dict):
+                continue
+            command = continuation.get("continuationEndpoint", {})
+        token = command.get("continuationCommand", {}).get("token", "")
+        if token:
+            return str(token)
+    return ""
+
+
+def _youtube_video_entries(data: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _walk_json(data):
+        renderer = item.get("videoRenderer") or item.get("gridVideoRenderer")
+        if not isinstance(renderer, dict):
+            lockup = item.get("lockupViewModel")
+            if not isinstance(lockup, dict) or lockup.get("contentType") != "LOCKUP_CONTENT_TYPE_VIDEO":
+                continue
+            video_id = str(lockup.get("contentId", ""))
+            title = str(lockup.get("metadata", {}).get("lockupMetadataViewModel", {}).get("title", {}).get("content", ""))
+        else:
+            video_id = str(renderer.get("videoId", ""))
+            title = "".join(str(run.get("text", "")) for run in renderer.get("title", {}).get("runs", []))
+        if video_id and video_id not in seen:
+            seen.add(video_id)
+            entries.append({"id": video_id, "title": title})
+    return entries
+
+
+def _expand_youtube_popular_playlist(
+    url: str,
+    max_videos: int,
+    cookies_file: Path | None,
+) -> YtdlpPlaylistResult:
+    cookie_jar = http.cookiejar.MozillaCookieJar()
+    if cookies_file is not None and cookies_file.exists():
+        try:
+            cookie_jar.load(str(cookies_file), ignore_discard=True, ignore_expires=True)
+        except (OSError, http.cookiejar.LoadError):
+            pass
+    opener = build_opener(HTTPCookieProcessor(cookie_jar))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+    }
+    try:
+        with opener.open(Request(url, headers=headers), timeout=30) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise DownloadError(f"YouTube popular page request failed: {exc}") from exc
+
+    initial_data = _youtube_initial_data(html)
+    token = _youtube_continuation_token(initial_data, popular_chip=True)
+    if not token:
+        raise DownloadError("YouTube channel page did not expose the Popular filter")
+    api_key_match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)', html)
+    client_version_match = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)', html)
+    if not api_key_match or not client_version_match:
+        raise DownloadError("YouTube channel page did not expose API configuration")
+
+    api_url = f"https://www.youtube.com/youtubei/v1/browse?key={api_key_match.group(1)}&prettyPrint=false"
+    entries: list[dict[str, Any]] = []
+    seen_tokens: set[str] = set()
+    while token and token not in seen_tokens and len(entries) < max_videos:
+        seen_tokens.add(token)
+        payload = json.dumps({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": client_version_match.group(1),
+                },
+            },
+            "continuation": token,
+        }).encode("utf-8")
+        request = Request(
+            api_url,
+            data=payload,
+            headers={**headers, "Content-Type": "application/json", "Origin": "https://www.youtube.com"},
+        )
+        try:
+            with opener.open(request, timeout=30) as response:
+                page_data = json.load(response)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DownloadError(f"YouTube popular list request failed: {exc}") from exc
+        entries.extend(_youtube_video_entries(page_data))
+        token = _youtube_continuation_token(page_data, popular_chip=False)
+
+    video_urls = [
+        f"https://www.youtube.com/watch?v={entry['id']}"
+        for entry in entries[:max_videos]
+    ]
+    if not video_urls:
+        raise DownloadError("YouTube Popular filter returned no videos")
+    uploader = ""
+    for item in _walk_json(initial_data):
+        metadata = item.get("channelMetadataRenderer")
+        if isinstance(metadata, dict) and metadata.get("title"):
+            uploader = str(metadata["title"])
+            break
+    log_info("ytdlp.playlist.youtube_popular_complete", url=full_url(url), videos=len(video_urls))
+    return YtdlpPlaylistResult(video_urls=video_urls, uploader=uploader)
+
+
 def _entry_url(entry: dict[str, Any]) -> str:
     entry_url = str(entry.get("url", "") or "")
     if entry_url:
@@ -159,6 +295,17 @@ def expand_ytdlp_playlist(
 ) -> YtdlpPlaylistResult:
     """Expand a playlist/channel URL to individual video URLs via yt-dlp."""
     normalized_order = "popular" if str(order).lower() == "popular" else "latest"
+    log_info("ytdlp.playlist.start", url=full_url(url), max_videos=max_videos, order=normalized_order)
+    if normalized_order == "popular" and _is_youtube_url(url):
+        try:
+            return _expand_youtube_popular_playlist(url, max_videos, cookies_file)
+        except DownloadError as exc:
+            log_warn(
+                "ytdlp.playlist.youtube_popular_fallback",
+                url=full_url(url),
+                error=str(exc),
+                message="YouTube 热门筛选暂时不可用，将扩大候选范围后按播放量降级排序",
+            )
     playlist_url = _with_bilibili_space_order(url, normalized_order)
     is_bilibili_space = _is_bilibili_space_url(playlist_url)
     fetch_count = (
@@ -176,7 +323,6 @@ def expand_ytdlp_playlist(
             for start in range(1, fetch_count + 1, 25)
         ]
 
-    log_info("ytdlp.playlist.start", url=full_url(playlist_url), max_videos=max_videos, order=normalized_order)
     entries: list[dict[str, Any]] = []
     seen_entry_urls: set[str] = set()
     uploader = ""

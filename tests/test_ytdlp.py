@@ -395,6 +395,11 @@ def test_expand_ytdlp_playlist_can_sort_by_popularity(monkeypatch):
         )
 
     monkeypatch.setattr(ytdlp.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        ytdlp,
+        "_expand_youtube_popular_playlist",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ytdlp.DownloadError("temporary failure")),
+    )
 
     result = ytdlp.expand_ytdlp_playlist("https://www.youtube.com/@demo/videos", max_videos=2, order="popular")
 
@@ -403,6 +408,33 @@ def test_expand_ytdlp_playlist_can_sort_by_popularity(monkeypatch):
         "https://www.youtube.com/watch?v=high",
         "https://www.youtube.com/watch?v=mid",
     ]
+
+
+def test_expand_ytdlp_playlist_uses_youtube_popular_filter(monkeypatch):
+    calls = []
+
+    def fake_popular(url, max_videos, cookies_file):
+        calls.append((url, max_videos, cookies_file))
+        return ytdlp.YtdlpPlaylistResult(
+            video_urls=["https://www.youtube.com/watch?v=popular"],
+            uploader="demo",
+        )
+
+    monkeypatch.setattr(ytdlp, "_expand_youtube_popular_playlist", fake_popular)
+    monkeypatch.setattr(
+        ytdlp.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("yt-dlp fallback should not run")),
+    )
+
+    result = ytdlp.expand_ytdlp_playlist(
+        "https://www.youtube.com/@demo/videos",
+        max_videos=2,
+        order="popular",
+    )
+
+    assert calls == [("https://www.youtube.com/@demo/videos", 2, None)]
+    assert result.video_urls == ["https://www.youtube.com/watch?v=popular"]
 
 
 def test_expand_bilibili_playlist_requests_click_order_for_popular(monkeypatch):
