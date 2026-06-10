@@ -334,26 +334,45 @@ def expand_ytdlp_playlist(
     uploader = ""
 
     for range_start, range_end in ranges:
-        cmd = [
-            *_yt_dlp_cmd(),
-            "--ignore-config",
-            "--flat-playlist",
-            "--dump-json",
-            "--no-warnings",
-            "--playlist-items", f"{range_start}:{range_end}",
-        ]
-        if cookies_file is not None:
-            cmd.extend(["--cookies", str(cookies_file)])
-        if remote_components:
-            cmd.extend(["--remote-components", YTDLP_REMOTE_COMPONENTS])
-        _append_youtube_extractor_args(cmd, extractor_args)
-        cmd.append(playlist_url)
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        except FileNotFoundError:
-            raise DownloadError("yt-dlp not found. Install it: pip install yt-dlp or brew install yt-dlp")
-        except subprocess.TimeoutExpired:
-            raise DownloadError("yt-dlp playlist expansion timed out after 120 seconds")
+        result = None
+        max_attempts = 3 if is_bilibili_space else 1
+        for attempt in range(max_attempts):
+            cmd = [
+                *_yt_dlp_cmd(),
+                "--ignore-config",
+                "--flat-playlist",
+                "--dump-json",
+                "--no-warnings",
+                "--playlist-items", f"{range_start}:{range_end}",
+            ]
+            if cookies_file is not None:
+                cmd.extend(["--cookies", str(cookies_file)])
+            if remote_components:
+                cmd.extend(["--remote-components", YTDLP_REMOTE_COMPONENTS])
+            _append_youtube_extractor_args(cmd, extractor_args)
+            cmd.append(playlist_url)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except FileNotFoundError:
+                raise DownloadError("yt-dlp not found. Install it: pip install yt-dlp or brew install yt-dlp")
+            except subprocess.TimeoutExpired:
+                raise DownloadError("yt-dlp playlist expansion timed out after 120 seconds")
+            error_text = (result.stderr or "").lower()
+            blocked = result.returncode != 0 and any(
+                marker in error_text for marker in ("server (352)", "server (412)", "blocked by server", "rejected by server")
+            )
+            if not blocked or attempt >= max_attempts - 1:
+                break
+            wait_secs = 5 * (attempt + 1)
+            log_warn(
+                "ytdlp.playlist.bilibili_retry",
+                range=f"{range_start}:{range_end}",
+                attempt=attempt + 1,
+                wait_secs=wait_secs,
+                error=(result.stderr or "").strip(),
+            )
+            time.sleep(wait_secs)
+        assert result is not None
         if result.returncode != 0:
             stderr = result.stderr.strip()
             if is_bilibili_space and entries:

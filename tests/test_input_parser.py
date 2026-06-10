@@ -31,3 +31,15 @@ def test_parse_input_canonicalizes_douyin_video_query(monkeypatch):
     )
     parsed = parse_input("https://v.douyin.com/NLC_JqxybmA/")
     assert parsed.canonical_url == "https://www.douyin.com/video/7615069974301780963"
+
+
+def test_parse_input_routes_xiaohongshu_note_through_ytdlp(monkeypatch):
+    monkeypatch.setattr(
+        "videocp.input_parser.resolve_url",
+        lambda url, timeout_secs=15: "https://www.xiaohongshu.com/discovery/item/6a28d06000000000060324e4",
+    )
+
+    parsed = parse_input("http://xhslink.com/o/4gvpM0C3HWn")
+
+    assert parsed.provider_key == "ytdlp"
+    assert parsed.is_profile is False

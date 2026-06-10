@@ -70,7 +70,9 @@ def parse_input(raw_input: str, timeout_secs: int = 15) -> ParsedInput:
             is_profile=is_profile,
         )
     is_profile = provider.is_profile_url(canonical_url)
-    if provider.key == "youtube" or (provider.key == "bilibili" and is_profile):
+    if provider.key == "youtube" or (provider.key == "bilibili" and is_profile) or (
+        provider.key == "xiaohongshu" and not is_profile
+    ):
         canonical = canonical_url if is_profile else provider.canonicalize_url(canonical_url)
         log_info("input.parse.complete", provider="ytdlp", canonical_url=full_url(canonical), is_profile=is_profile)
         return ParsedInput(

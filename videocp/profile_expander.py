@@ -332,10 +332,47 @@ def _expand_bilibili_profile(
         else:
             scroll_attempts = 0
 
+    # Current space pages commonly render 40 cards per page. Prefer clicking
+    # the actual next-page control so the SPA emits the next signed API
+    # request; changing only the pn query can be ignored by the client.
+    clicked_pages = 0
+    max_click_pages = max(1, (max_videos + 39) // 40 - 1)
+    next_page_selectors = [
+        'button[aria-label*="下一页"]',
+        'button:has-text("下一页")',
+        '.vui_pagenation--btn-side:last-child',
+        '.be-pager-next',
+    ]
+    while len(collected_bvids) < max_videos and clicked_pages < max_click_pages:
+        before = len(collected_bvids)
+        clicked = False
+        for selector in next_page_selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() == 0 or locator.is_disabled():
+                    continue
+                locator.click()
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            break
+        clicked_pages += 1
+        page.wait_for_timeout(2500)
+        collect_from_dom()
+        log_info(
+            "profile.expand.bilibili_next_clicked",
+            page=clicked_pages + 1,
+            collected=len(collected_bvids),
+        )
+        if len(collected_bvids) == before:
+            break
+
     # Bilibili space pages are paginated rather than infinitely scrolling.
     # Navigate explicit page numbers when the first page does not satisfy the
     # requested count. This also avoids repeatedly hitting the guarded WBI API.
-    page_number = 2
+    page_number = max(2, clicked_pages + 2)
     max_page_number = max(2, (max_videos + 24) // 25 + 1)
     while len(collected_bvids) < max_videos and page_number <= max_page_number:
         before = len(collected_bvids)

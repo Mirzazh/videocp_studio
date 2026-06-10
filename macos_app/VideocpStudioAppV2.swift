@@ -1480,10 +1480,19 @@ final class AppModel: ObservableObject {
     }
 
     private func migrateLegacyTencentAccount() {
-        guard config.tencent_accounts.isEmpty else { return }
+        var changed = false
+        for index in config.tencent_accounts.indices
+        where config.tencent_accounts[index].name == "原有频道账号" {
+            config.tencent_accounts[index].name = ""
+            changed = true
+        }
+        if !config.tencent_accounts.isEmpty {
+            if changed { save() }
+            return
+        }
         let token = legacyTencentToken()
         guard !token.isEmpty else { return }
-        let account = TencentAccount(name: "原有频道账号", token: token, verified: true)
+        let account = TencentAccount(name: "", token: token, verified: true)
         config.tencent_accounts = [account]
         config.publish.account_id = account.id
         for index in config.automation.publish_tasks.indices where config.automation.publish_tasks[index].account_id.isEmpty {

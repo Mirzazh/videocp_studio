@@ -546,6 +546,40 @@ def test_expand_bilibili_playlist_stops_when_next_range_is_empty(monkeypatch):
     assert len(result.video_urls) == 25
 
 
+def test_expand_bilibili_playlist_retries_server_block(monkeypatch):
+    attempts = []
+    sleeps = []
+
+    def fake_run(cmd, capture_output, text, timeout):
+        playlist_range = cmd[cmd.index("--playlist-items") + 1]
+        attempts.append(playlist_range)
+        if playlist_range == "26:50" and attempts.count(playlist_range) == 1:
+            return SimpleNamespace(
+                returncode=1,
+                stderr="Request is blocked by server (412), please wait and try later.",
+                stdout="",
+            )
+        start, end = (int(value) for value in playlist_range.split(":"))
+        stdout = "\n".join(
+            f'{{"id":"BV{index:03d}","ie_key":"BiliBili"}}'
+            for index in range(start, end + 1)
+        )
+        return SimpleNamespace(returncode=0, stderr="", stdout=stdout)
+
+    monkeypatch.setattr(ytdlp.subprocess, "run", fake_run)
+    monkeypatch.setattr(ytdlp.time, "sleep", sleeps.append)
+
+    result = ytdlp.expand_ytdlp_playlist(
+        "https://space.bilibili.com/7612168/video",
+        max_videos=50,
+        order="latest",
+    )
+
+    assert attempts == ["1:25", "26:50", "26:50"]
+    assert sleeps == [5]
+    assert len(result.video_urls) == 50
+
+
 def test_app_bilibili_short_playlist_result_is_filled_by_browser(monkeypatch):
     profile = ParsedInput(
         raw_input="https://space.bilibili.com/7612168/video",
