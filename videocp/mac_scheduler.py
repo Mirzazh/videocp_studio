@@ -55,6 +55,7 @@ DEFAULT_APP_CONFIG = {
         "title_template": "{title}",
         "content_template": "{title}",
         "strip_tags_mentions": True,
+        "title_exclusions": "",
         "delete_after_publish": True,
         "retry_count": 2,
     },

@@ -4,7 +4,7 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
-private let appVersion = "1.1.1"
+private let appVersion = "1.1.2"
 private let appReleaseAPIURL = URL(string: "https://api.github.com/repos/Mirzazh/videocp_studio/releases/latest")!
 private let appReleasePageURL = URL(string: "https://github.com/Mirzazh/videocp_studio/releases/latest")!
 
@@ -192,13 +192,14 @@ struct PublishSettings: Codable {
     var title_template: String = "{title}"
     var content_template: String = "{title}"
     var strip_tags_mentions: Bool = true
+    var title_exclusions: String = ""
     var translate_title_zh_cn: Bool = false
     var delete_after_publish: Bool = true
     var retry_video_path: String = ""
 
     enum CodingKeys: String, CodingKey {
         case input_dir, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
-        case title_template, content_template, strip_tags_mentions, translate_title_zh_cn
+        case title_template, content_template, strip_tags_mentions, title_exclusions, translate_title_zh_cn
         case delete_after_publish, retry_video_path
     }
 
@@ -217,6 +218,7 @@ struct PublishSettings: Codable {
         title_template = try c.decodeIfPresent(String.self, forKey: .title_template) ?? title_template
         content_template = try c.decodeIfPresent(String.self, forKey: .content_template) ?? content_template
         strip_tags_mentions = try c.decodeIfPresent(Bool.self, forKey: .strip_tags_mentions) ?? strip_tags_mentions
+        title_exclusions = try c.decodeIfPresent(String.self, forKey: .title_exclusions) ?? title_exclusions
         translate_title_zh_cn = try c.decodeIfPresent(Bool.self, forKey: .translate_title_zh_cn) ?? translate_title_zh_cn
         delete_after_publish = try c.decodeIfPresent(Bool.self, forKey: .delete_after_publish) ?? delete_after_publish
         retry_video_path = try c.decodeIfPresent(String.self, forKey: .retry_video_path) ?? retry_video_path
@@ -312,13 +314,14 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
     var title_template: String = "{title}"
     var content_template: String = "{title}"
     var strip_tags_mentions: Bool = true
+    var title_exclusions: String = ""
     var translate_title_zh_cn: Bool = false
     var delete_after_publish: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case id, settings_version, directories, interval_minutes, order, enabled, active_start, active_end
         case scope, guild_id, channel_id, feed_type, limit, title_template, content_template
-        case strip_tags_mentions, translate_title_zh_cn, delete_after_publish
+        case strip_tags_mentions, title_exclusions, translate_title_zh_cn, delete_after_publish
     }
 
     init(
@@ -337,6 +340,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
         title_template: String = "{title}",
         content_template: String = "{title}",
         strip_tags_mentions: Bool = true,
+        title_exclusions: String = "",
         translate_title_zh_cn: Bool = false,
         delete_after_publish: Bool = true
     ) {
@@ -355,6 +359,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
         self.title_template = title_template
         self.content_template = content_template
         self.strip_tags_mentions = strip_tags_mentions
+        self.title_exclusions = title_exclusions
         self.translate_title_zh_cn = translate_title_zh_cn
         self.delete_after_publish = delete_after_publish
     }
@@ -377,6 +382,7 @@ struct ScheduledPublishTask: Codable, Identifiable, Equatable {
         title_template = try c.decodeIfPresent(String.self, forKey: .title_template) ?? "{title}"
         content_template = try c.decodeIfPresent(String.self, forKey: .content_template) ?? "{title}"
         strip_tags_mentions = try c.decodeIfPresent(Bool.self, forKey: .strip_tags_mentions) ?? true
+        title_exclusions = try c.decodeIfPresent(String.self, forKey: .title_exclusions) ?? ""
         translate_title_zh_cn = try c.decodeIfPresent(Bool.self, forKey: .translate_title_zh_cn) ?? false
         delete_after_publish = try c.decodeIfPresent(Bool.self, forKey: .delete_after_publish) ?? true
     }
@@ -703,6 +709,7 @@ final class AppModel: ObservableObject {
                     title_template: config.publish.title_template,
                     content_template: config.publish.content_template,
                     strip_tags_mentions: config.publish.strip_tags_mentions,
+                    title_exclusions: config.publish.title_exclusions,
                     translate_title_zh_cn: config.publish.translate_title_zh_cn,
                     delete_after_publish: config.publish.delete_after_publish
                 )
@@ -739,6 +746,7 @@ final class AppModel: ObservableObject {
                 config.automation.publish_tasks[index].title_template = config.publish.title_template
                 config.automation.publish_tasks[index].content_template = config.publish.content_template
                 config.automation.publish_tasks[index].strip_tags_mentions = config.publish.strip_tags_mentions
+                config.automation.publish_tasks[index].title_exclusions = config.publish.title_exclusions
                 config.automation.publish_tasks[index].translate_title_zh_cn = config.publish.translate_title_zh_cn
                 config.automation.publish_tasks[index].delete_after_publish = config.publish.delete_after_publish
                 migrated = true
@@ -1343,6 +1351,7 @@ final class AppModel: ObservableObject {
             title_template: config.publish.title_template,
             content_template: config.publish.content_template,
             strip_tags_mentions: config.publish.strip_tags_mentions,
+            title_exclusions: config.publish.title_exclusions,
             translate_title_zh_cn: config.publish.translate_title_zh_cn,
             delete_after_publish: config.publish.delete_after_publish
         )
@@ -1397,6 +1406,7 @@ final class AppModel: ObservableObject {
                 title_template: config.publish.title_template,
                 content_template: config.publish.content_template,
                 strip_tags_mentions: config.publish.strip_tags_mentions,
+                title_exclusions: config.publish.title_exclusions,
                 translate_title_zh_cn: config.publish.translate_title_zh_cn,
                 delete_after_publish: config.publish.delete_after_publish
             )
@@ -1876,6 +1886,7 @@ final class AppModel: ObservableObject {
         snapshot.publish.title_template = task.title_template
         snapshot.publish.content_template = task.content_template
         snapshot.publish.strip_tags_mentions = task.strip_tags_mentions
+        snapshot.publish.title_exclusions = task.title_exclusions
         snapshot.publish.translate_title_zh_cn = task.translate_title_zh_cn
         snapshot.publish.delete_after_publish = task.delete_after_publish
         snapshot.publish.retry_video_path = retryVideoPath
@@ -2691,6 +2702,7 @@ struct ContentView: View {
     @State private var schedulePublishTitleTemplateDraft = "{title}"
     @State private var schedulePublishContentTemplateDraft = "{title}"
     @State private var schedulePublishStripTagsDraft = true
+    @State private var schedulePublishTitleExclusionsDraft = ""
     @State private var schedulePublishTranslateDraft = false
     @State private var schedulePublishDeleteAfterDraft = true
     @State private var editingDownloadTask: ScheduledDownloadTask?
@@ -3659,6 +3671,7 @@ struct ContentView: View {
                     field("标题模板", text: $model.config.publish.title_template)
                     field("正文模板", text: $model.config.publish.content_template)
                 }
+                field("标题剔除词（多个用逗号分隔）", text: $model.config.publish.title_exclusions)
                 HStack(spacing: 18) {
                     Toggle("剔除 # 和 @", isOn: $model.config.publish.strip_tags_mentions)
                     Toggle("标题翻译为简体中文", isOn: $model.config.publish.translate_title_zh_cn)
@@ -3670,6 +3683,9 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Text("例如填写“凤凰解说王者荣耀”，标题末尾的“【凤凰解说王者荣耀】”会连同空括号一起移除。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text("发布失败时会自动重试 2 次。最终仍失败的视频会保留在原目录，并记录为失败，不会进入已发布去重。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -3858,6 +3874,7 @@ struct ContentView: View {
                                 task.scope == "channel" ? "频道内" : "创作者全局",
                                 task.feed_type == 2 ? "长帖" : "短帖",
                                 task.strip_tags_mentions ? "剔除#和@" : nil,
+                                task.title_exclusions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : "剔除指定词",
                                 task.translate_title_zh_cn ? "翻译中文" : nil,
                                 "每次 \(task.limit) 条"
                             ].compactMap { $0 }.joined(separator: " · "))
@@ -4011,6 +4028,7 @@ struct ContentView: View {
         schedulePublishTitleTemplateDraft = settings.title_template
         schedulePublishContentTemplateDraft = settings.content_template
         schedulePublishStripTagsDraft = settings.strip_tags_mentions
+        schedulePublishTitleExclusionsDraft = settings.title_exclusions
         schedulePublishTranslateDraft = settings.translate_title_zh_cn
         schedulePublishDeleteAfterDraft = settings.delete_after_publish
     }
@@ -4024,6 +4042,7 @@ struct ContentView: View {
         schedulePublishTitleTemplateDraft = task.title_template
         schedulePublishContentTemplateDraft = task.content_template
         schedulePublishStripTagsDraft = task.strip_tags_mentions
+        schedulePublishTitleExclusionsDraft = task.title_exclusions
         schedulePublishTranslateDraft = task.translate_title_zh_cn
         schedulePublishDeleteAfterDraft = task.delete_after_publish
     }
@@ -4045,6 +4064,7 @@ struct ContentView: View {
             title_template: schedulePublishTitleTemplateDraft,
             content_template: schedulePublishContentTemplateDraft,
             strip_tags_mentions: schedulePublishStripTagsDraft,
+            title_exclusions: schedulePublishTitleExclusionsDraft,
             translate_title_zh_cn: schedulePublishTranslateDraft,
             delete_after_publish: schedulePublishDeleteAfterDraft
         )
@@ -4141,6 +4161,7 @@ struct ContentView: View {
                             field("标题模板", text: $schedulePublishTitleTemplateDraft)
                             field("正文模板", text: $schedulePublishContentTemplateDraft)
                         }
+                        field("标题剔除词（多个用逗号分隔）", text: $schedulePublishTitleExclusionsDraft)
                         HStack(spacing: 18) {
                             Toggle("剔除 # 和 @", isOn: $schedulePublishStripTagsDraft)
                             Toggle("标题翻译为简体中文", isOn: $schedulePublishTranslateDraft)

@@ -25,6 +25,9 @@ from videocp.ytdlp import YtdlpPlaylistResult, expand_ytdlp_playlist
 VIDEO_SUFFIXES = {".mp4", ".m4v", ".mov", ".webm", ".mkv"}
 TAG_OR_MENTION_RE = re.compile(r"[#@][^\s#@]+")
 CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+TITLE_EXCLUSION_SEPARATOR_RE = re.compile(r"[\r\n,，;；]+")
+EMPTY_TITLE_WRAPPER_RE = re.compile(r"【\s*】|\[\s*\]|\(\s*\)|（\s*）|《\s*》|〈\s*〉|「\s*」|『\s*』")
+TITLE_EDGE_SEPARATOR_CHARS = " \t\r\n-–—_|｜:：·•,，;；/\\"
 DEFAULT_YOUTUBE_EXTRACTOR_ARGS = "youtube:player_client=mweb;fetch_pot=always"
 GOOGLE_TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 EDGE_TRANSLATE_AUTH_ENDPOINT = "https://edge.microsoft.com/translate/auth"
@@ -304,12 +307,42 @@ def _sidecar_for_video(video_path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _clean_title(title: str, strip_tags_mentions: bool) -> str:
+def _parse_title_exclusions(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        candidates = [str(item).strip() for item in value]
+    else:
+        candidates = [item.strip() for item in TITLE_EXCLUSION_SEPARATOR_RE.split(str(value or ""))]
+
+    exclusions: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = candidate.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        exclusions.append(candidate)
+    return exclusions
+
+
+def _remove_title_exclusions(title: str, exclusions: list[str]) -> str:
+    cleaned = str(title or "")
+    for exclusion in sorted(exclusions, key=len, reverse=True):
+        cleaned = re.sub(re.escape(exclusion), "", cleaned, flags=re.IGNORECASE)
+    while True:
+        without_empty_wrappers = EMPTY_TITLE_WRAPPER_RE.sub("", cleaned)
+        if without_empty_wrappers == cleaned:
+            break
+        cleaned = without_empty_wrappers
+    return " ".join(cleaned.split()).strip(TITLE_EDGE_SEPARATOR_CHARS)
+
+
+def _clean_title(title: str, strip_tags_mentions: bool, exclusions: list[str] | None = None) -> str:
     cleaned = str(title or "").strip()
     if strip_tags_mentions:
         cleaned = TAG_OR_MENTION_RE.sub("", cleaned)
-    cleaned = " ".join(cleaned.split())
-    return cleaned
+    return _remove_title_exclusions(cleaned, exclusions or [])
 
 
 def _preferred_sidecar_title(sidecar: dict[str, Any], fallback: str) -> str:
@@ -431,6 +464,7 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
     feed_type = int(publish_raw.get("feed_type") or 1)
     limit = max(1, int(publish_raw.get("limit") or 1))
     strip_tags_mentions = _as_bool(publish_raw.get("strip_tags_mentions"), True)
+    title_exclusions = _parse_title_exclusions(publish_raw.get("title_exclusions"))
     translate_title_zh_cn = _as_bool(publish_raw.get("translate_title_zh_cn"), False)
     delete_after_publish = _as_bool(publish_raw.get("delete_after_publish"), True)
     retry_count = max(0, min(5, int(publish_raw.get("retry_count") or 2)))
@@ -471,10 +505,11 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
 
         raw_title = str(sidecar.get("title") or sidecar.get("desc") or video_path.stem)
         preferred_title = _preferred_sidecar_title(sidecar, video_path.stem)
-        clean_title = _clean_title(preferred_title, strip_tags_mentions)
+        clean_title = _clean_title(preferred_title, strip_tags_mentions, title_exclusions)
         if translate_title_zh_cn:
             try:
                 clean_title = _translate_title_to_simplified_chinese(clean_title)
+                clean_title = _remove_title_exclusions(clean_title, title_exclusions)
             except RuntimeError as exc:
                 error = str(exc)
                 add_entry(
@@ -509,7 +544,7 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
             "site": str(sidecar.get("site", "")),
             "desc": str(sidecar.get("desc", "")),
         }
-        title = _format_template(title_template, values)
+        title = _remove_title_exclusions(_format_template(title_template, values), title_exclusions)
         content = _format_template(content_template, values)
         result = None
         for attempt in range(retry_count + 1):

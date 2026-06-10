@@ -16,7 +16,7 @@ APP="$STAGING/$APP_NAME.app"
 RUNTIME="$APP/Contents/Resources/runtime"
 PYTHON_SOURCE="$(dirname "$(dirname "$(readlink "$ROOT/.venv/bin/python3")")")"
 SITE_PACKAGES="$ROOT/.venv/lib/python3.12/site-packages"
-ZIP="$RELEASE_ROOT/Videocp-Studio-1.1.1-macOS-arm64.zip"
+ZIP="$RELEASE_ROOT/Videocp-Studio-1.1.2-macOS-arm64.zip"
 CLI_SOURCE="$(command -v tencent-channel-cli || true)"
 
 if [[ -z "$CLI_SOURCE" || ! -f "$CLI_SOURCE" ]]; then
@@ -25,6 +25,7 @@ if [[ -z "$CLI_SOURCE" || ! -f "$CLI_SOURCE" ]]; then
 fi
 
 "$ROOT/scripts/build_macos_app.sh"
+mkdir -p "$RELEASE_ROOT"
 rm -f "$ZIP"
 mkdir -p "$STAGING"
 ditto "$SOURCE_APP" "$APP"

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from videocp.mac_workflow import (
     _clean_title,
+    _parse_title_exclusions,
     _preferred_sidecar_title,
     _translate_title_to_simplified_chinese,
     parse_profile_from_app_config,
@@ -18,6 +19,17 @@ def test_clean_title_strips_tags_and_mentions():
     assert _clean_title("原始标题 #热点 @某人  结尾", True) == "原始标题 结尾"
     assert _clean_title("原始标题#热点 @某人", True) == "原始标题"
     assert _clean_title("原始标题 #热点", False) == "原始标题 #热点"
+
+
+def test_clean_title_removes_configured_author_suffix_and_empty_wrapper():
+    exclusions = _parse_title_exclusions("凤凰解说王者荣耀，搬运账号")
+
+    assert _clean_title("吕布如何对线狂铁？【凤凰解说王者荣耀】", False, exclusions) == "吕布如何对线狂铁？"
+    assert _clean_title("搬运账号 - Demo Title", False, exclusions) == "Demo Title"
+
+
+def test_parse_title_exclusions_supports_multiple_separators_and_deduplicates():
+    assert _parse_title_exclusions("作者甲, 作者乙；作者甲\n作者丙") == ["作者甲", "作者乙", "作者丙"]
 
 
 def test_preferred_sidecar_title_uses_explicit_chinese_title():
@@ -472,6 +484,54 @@ def test_publish_from_directory_uses_sidecar_title_records_and_deletes(tmp_path:
     assert not video.with_suffix(".json").exists()
     history = json.loads((tmp_path / "history.json").read_text(encoding="utf-8"))
     assert history["entries"][0]["content_id"] == "cid-1"
+
+
+def test_publish_applies_title_exclusions_before_templates(tmp_path: Path, monkeypatch):
+    video = tmp_path / "downloads" / "demo.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    video.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "content_id": "excluded-title",
+                "title": "吕布如何对线狂铁？【凤凰解说王者荣耀】",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(video.parent),
+                    "history_file": str(tmp_path / "history.json"),
+                    "title_exclusions": "凤凰解说王者荣耀",
+                    "title_template": "{title}",
+                    "content_template": "正文：{title}",
+                    "delete_after_publish": False,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+    monkeypatch.setattr(
+        "videocp.mac_workflow.publish_to_channel",
+        lambda **kwargs: captured.update(kwargs) or PublishResult(
+            success=True,
+            feed_id="feed-excluded",
+            share_url="https://pd.qq.com/excluded",
+        ),
+    )
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["ok"] is True
+    assert captured["title"] == "吕布如何对线狂铁？"
+    assert captured["content"] == "正文：吕布如何对线狂铁？"
 
 
 def test_publish_translates_cleaned_title_before_templates(tmp_path: Path, monkeypatch):

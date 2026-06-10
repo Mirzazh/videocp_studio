@@ -28,6 +28,15 @@
     "profile_url_draft": "",
     "profiles": []
   },
+  "publish": {
+    "input_dir": "./downloads",
+    "title_template": "{title}",
+    "content_template": "{title}",
+    "strip_tags_mentions": true,
+    "title_exclusions": "凤凰解说王者荣耀",
+    "translate_title_zh_cn": false,
+    "delete_after_publish": true
+  },
   "sources": [
     {
       "enabled": true,
