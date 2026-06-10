@@ -1,9 +1,10 @@
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from videocp.errors import DownloadError
-from videocp.profile_expander import _bilibili_video_page_url, _expand_xiaohongshu_profile
+from videocp.profile_expander import _bilibili_video_page_url, _expand_bilibili_profile, _expand_xiaohongshu_profile
 
 
 class FakeXhsPage:
@@ -46,6 +47,82 @@ class FakeXhsPage:
         return None
 
 
+class EmptyLocator:
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 0
+
+    def is_disabled(self):
+        return True
+
+    def click(self):
+        raise AssertionError("empty locator should not be clicked")
+
+
+class FakeBilibiliPage:
+    def __init__(self, pages: dict[int, list[str]], direct_pages: set[int] | None = None):
+        self.pages = pages
+        self.direct_pages = direct_pages or {1}
+        self.response_handler = None
+        self.goto_urls: list[str] = []
+        self.clicked_pages: list[int] = []
+
+    def on(self, event, handler):
+        if event == "response":
+            self.response_handler = handler
+
+    def _emit_page(self, page_number: int):
+        if self.response_handler is None or page_number not in self.pages:
+            return
+        self.response_handler(
+            SimpleNamespace(
+                url=f"https://api.bilibili.com/x/space/wbi/arc/search?pn={page_number}",
+                headers={"content-type": "application/json"},
+                json=lambda: {
+                    "data": {
+                        "archives": [
+                            {"bvid": bvid}
+                            for bvid in self.pages[page_number]
+                        ]
+                    }
+                },
+            )
+        )
+
+    def goto(self, url, *args, **kwargs):
+        self.goto_urls.append(url)
+        parsed = urlparse(url)
+        page_number = int(parse_qs(parsed.query).get("pn", ["1"])[0])
+        if page_number in self.direct_pages:
+            self._emit_page(page_number)
+
+    def wait_for_load_state(self, *args, **kwargs):
+        return None
+
+    def wait_for_timeout(self, milliseconds):
+        return None
+
+    def eval_on_selector_all(self, selector, script):
+        return []
+
+    def evaluate(self, script, arg=None):
+        if arg is not None:
+            page_number = int(arg)
+            self.clicked_pages.append(page_number)
+            self._emit_page(page_number)
+            return page_number in self.pages
+        return None
+
+    def locator(self, selector):
+        return EmptyLocator()
+
+    def query_selector(self, selector):
+        return SimpleNamespace(text_content=lambda: "测试UP主")
+
+
 def test_bilibili_page_url_preserves_order_and_sets_page_number():
     result = _bilibili_video_page_url(
         "https://space.bilibili.com/7612168/video?order=click",
@@ -53,6 +130,49 @@ def test_bilibili_page_url_preserves_order_and_sets_page_number():
     )
 
     assert result == "https://space.bilibili.com/7612168/video?order=click&pn=3"
+
+
+def test_bilibili_profile_keeps_collecting_after_first_40_by_clicking_next():
+    page = FakeBilibiliPage(
+        pages={
+            1: [f"BV{index:03d}" for index in range(1, 41)],
+            2: [f"BV{index:03d}" for index in range(41, 81)],
+        },
+        direct_pages={1},
+    )
+
+    result = _expand_bilibili_profile(
+        page=page,
+        profile_url="https://space.bilibili.com/7612168/video",
+        max_videos=80,
+        timeout_secs=1,
+    )
+
+    assert len(result.video_urls) == 80
+    assert result.video_urls[39] == "https://www.bilibili.com/video/BV040"
+    assert result.video_urls[-1] == "https://www.bilibili.com/video/BV080"
+    assert page.clicked_pages == [2]
+
+
+def test_bilibili_profile_popular_pagination_preserves_click_order():
+    page = FakeBilibiliPage(
+        pages={
+            1: [f"BV{index:03d}" for index in range(1, 41)],
+            2: [f"BV{index:03d}" for index in range(41, 51)],
+        },
+        direct_pages={1, 2},
+    )
+
+    result = _expand_bilibili_profile(
+        page=page,
+        profile_url="https://space.bilibili.com/7612168/video?order=click",
+        max_videos=45,
+        timeout_secs=1,
+    )
+
+    assert len(result.video_urls) == 45
+    assert result.video_urls[-1] == "https://www.bilibili.com/video/BV045"
+    assert any("order=click" in url and "pn=2" in url for url in page.goto_urls)
 
 
 def test_xiaohongshu_profile_waits_for_login_then_continues():

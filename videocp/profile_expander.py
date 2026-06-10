@@ -37,6 +37,63 @@ def _bilibili_video_page_url(profile_url: str, page_number: int) -> str:
     return urlunparse(parsed._replace(path=path, query=urlencode(query)))
 
 
+def _click_bilibili_next_page(page: Page, target_page_number: int) -> bool:
+    """Click Bilibili's next/page-number control when direct pn navigation stalls."""
+    next_page_selectors = [
+        'button[aria-label*="下一页"]',
+        'button:has-text("下一页")',
+        'a:has-text("下一页")',
+        '.vui_pagenation--btn-side:last-child',
+        '.be-pager-next',
+    ]
+    for selector in next_page_selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() == 0 or locator.is_disabled():
+                continue
+            locator.click()
+            return True
+        except Exception:
+            continue
+
+    try:
+        return bool(page.evaluate(
+            """(targetPage) => {
+                const disabled = (el) => {
+                    const cls = String(el.className || '');
+                    return Boolean(el.disabled)
+                        || el.getAttribute('aria-disabled') === 'true'
+                        || cls.includes('disabled');
+                };
+                const candidates = Array.from(document.querySelectorAll('button,a,li,[role="button"]'));
+                const nextLabels = ['下一页', '下一頁', '下一', '下页'];
+                for (const el of candidates) {
+                    const label = [
+                        el.textContent || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || ''
+                    ].join(' ').trim();
+                    if (!disabled(el) && nextLabels.some((item) => label.includes(item))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                const target = String(targetPage);
+                for (const el of candidates) {
+                    const label = String(el.textContent || '').trim();
+                    if (!disabled(el) && label === target) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            max(1, target_page_number),
+        ))
+    except Exception:
+        return False
+
+
 def _extract_author_from_dom(page: Page, selectors: list[str]) -> str:
     """Try multiple CSS selectors to extract the profile author name from the page."""
     for selector in selectors:
@@ -317,62 +374,31 @@ def _expand_bilibili_profile(
                     collected_bvids.append(bvid)
         return len(collected_bvids) - before
 
-    collect_from_dom()
-
-    # Scroll first in case the current Bilibili layout lazy-loads cards.
-    scroll_attempts = 0
-    max_scroll_attempts = 5
-    while len(collected_bvids) < max_videos and scroll_attempts < max_scroll_attempts:
-        prev_count = len(collected_bvids)
-        page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-        page.wait_for_timeout(2000)
-        collect_from_dom()
-        if len(collected_bvids) == prev_count:
-            scroll_attempts += 1
-        else:
-            scroll_attempts = 0
-
-    # Current space pages commonly render 40 cards per page. Prefer clicking
-    # the actual next-page control so the SPA emits the next signed API
-    # request; changing only the pn query can be ignored by the client.
-    clicked_pages = 0
-    max_click_pages = max(1, (max_videos + 39) // 40 - 1)
-    next_page_selectors = [
-        'button[aria-label*="下一页"]',
-        'button:has-text("下一页")',
-        '.vui_pagenation--btn-side:last-child',
-        '.be-pager-next',
-    ]
-    while len(collected_bvids) < max_videos and clicked_pages < max_click_pages:
+    def collect_current_page(*, max_empty_scrolls: int = 3) -> int:
+        """Collect the current page and scroll a little for lazy-rendered cards."""
         before = len(collected_bvids)
-        clicked = False
-        for selector in next_page_selectors:
-            try:
-                locator = page.locator(selector).first
-                if locator.count() == 0 or locator.is_disabled():
-                    continue
-                locator.click()
-                clicked = True
-                break
-            except Exception:
-                continue
-        if not clicked:
-            break
-        clicked_pages += 1
-        page.wait_for_timeout(2500)
         collect_from_dom()
-        log_info(
-            "profile.expand.bilibili_next_clicked",
-            page=clicked_pages + 1,
-            collected=len(collected_bvids),
-        )
-        if len(collected_bvids) == before:
-            break
+        empty_scrolls = 0
+        while len(collected_bvids) < max_videos and empty_scrolls < max_empty_scrolls:
+            previous = len(collected_bvids)
+            try:
+                page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+            except Exception:
+                break
+            page.wait_for_timeout(1500)
+            collect_from_dom()
+            if len(collected_bvids) == previous:
+                empty_scrolls += 1
+            else:
+                empty_scrolls = 0
+        return len(collected_bvids) - before
 
-    # Bilibili space pages are paginated rather than infinitely scrolling.
-    # Navigate explicit page numbers when the first page does not satisfy the
-    # requested count. This also avoids repeatedly hitting the guarded WBI API.
-    page_number = max(2, clicked_pages + 2)
+    collect_current_page(max_empty_scrolls=5)
+
+    # Keep walking from the newest page to older pages until the requested
+    # amount is satisfied or Bilibili stops yielding new cards. The URL keeps
+    # the user's order parameter: latest -> pubdate, popular -> click.
+    page_number = 2
     max_page_number = max(2, (max_videos + 24) // 25 + 1)
     while len(collected_bvids) < max_videos and page_number <= max_page_number:
         before = len(collected_bvids)
@@ -385,8 +411,12 @@ def _expand_bilibili_profile(
         )
         try:
             page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_secs * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout_secs * 1000, 8000))
+            except Exception:
+                pass
             page.wait_for_timeout(2000)
-            collect_from_dom()
+            collect_current_page()
         except Exception as exc:
             log_warn(
                 "profile.expand.bilibili_page_failed",
@@ -395,6 +425,20 @@ def _expand_bilibili_profile(
             )
             break
         if len(collected_bvids) == before:
+            if _click_bilibili_next_page(page, page_number):
+                page.wait_for_timeout(2500)
+                collect_current_page()
+                log_info(
+                    "profile.expand.bilibili_next_clicked",
+                    page=page_number,
+                    collected=len(collected_bvids),
+                )
+        if len(collected_bvids) == before:
+            log_info(
+                "profile.expand.bilibili_no_more",
+                page=page_number,
+                collected=len(collected_bvids),
+            )
             break
         page_number += 1
 
