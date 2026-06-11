@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -457,6 +458,15 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
         publish_raw.get("input_dir") or (app_config.get("download") or {}).get("output_dir", "./downloads"),
         base_dir,
     )
+    raw_input_dirs = publish_raw.get("input_dirs") or []
+    input_dirs = [
+        resolve_config_path(value, base_dir)
+        for value in raw_input_dirs
+        if str(value or "").strip()
+    ]
+    selection_order = str(publish_raw.get("selection_order") or "sequential").strip().lower()
+    if selection_order not in {"sequential", "random"}:
+        selection_order = "sequential"
     history_file = resolve_config_path(publish_raw.get("history_file", "./publish_history_mac.json"), base_dir)
     skill_dir = resolve_config_path(publish_raw.get("skill_dir", "~/.openclaw/workspace/skills/tencent-channel-community"), base_dir)
     guild_id = str(publish_raw.get("guild_id", "") or "").strip()
@@ -479,7 +489,9 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
     content_template = str(publish_raw.get("content_template") or "{title}")
     retry_video_path = str(publish_raw.get("retry_video_path") or "").strip()
 
-    if not retry_video_path and not input_dir.exists():
+    source_dirs = input_dirs if selection_order == "random" and input_dirs else [input_dir]
+    existing_source_dirs = [path for path in source_dirs if path.exists() and path.is_dir()]
+    if not retry_video_path and not existing_source_dirs:
         return [WorkflowResult(ok=False, action="failed", error=f"目录不存在: {input_dir}").to_dict()]
     if retry_video_path:
         retry_path = resolve_config_path(retry_video_path, base_dir)
@@ -487,10 +499,17 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
             return [WorkflowResult(ok=False, action="failed", path=str(retry_path), error=f"视频不存在: {retry_path}").to_dict()]
         videos = [retry_path]
     else:
+        unique_videos: dict[str, Path] = {}
+        for source_dir in existing_source_dirs:
+            for path in source_dir.rglob("*"):
+                if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
+                    unique_videos[str(path.resolve())] = path
         videos = sorted(
-            [path for path in input_dir.rglob("*") if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES],
+            unique_videos.values(),
             key=lambda path: path.stat().st_mtime,
         )
+        if selection_order == "random":
+            random.shuffle(videos)
     if not videos:
         return [WorkflowResult(ok=True, action="no_video").to_dict()]
 

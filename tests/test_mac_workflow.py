@@ -486,6 +486,50 @@ def test_publish_from_directory_uses_sidecar_title_records_and_deletes(tmp_path:
     assert history["entries"][0]["content_id"] == "cid-1"
 
 
+def test_publish_random_order_uses_global_pool_across_directories(tmp_path: Path, monkeypatch):
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second" / "nested"
+    first_dir.mkdir()
+    second_dir.mkdir(parents=True)
+    first_video = first_dir / "first.mp4"
+    second_video = second_dir / "second.mp4"
+    first_video.write_bytes(b"first")
+    second_video.write_bytes(b"second")
+    first_video.with_suffix(".json").write_text(json.dumps({"content_id": "first"}), encoding="utf-8")
+    second_video.with_suffix(".json").write_text(json.dumps({"content_id": "second"}), encoding="utf-8")
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(first_dir),
+                    "input_dirs": [str(first_dir), str(tmp_path / "second")],
+                    "selection_order": "random",
+                    "history_file": str(tmp_path / "history.json"),
+                    "limit": 1,
+                    "delete_after_publish": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = []
+    monkeypatch.setattr("videocp.mac_workflow.random.shuffle", lambda items: items.reverse())
+    monkeypatch.setattr(
+        "videocp.mac_workflow.publish_to_channel",
+        lambda **kwargs: captured.append(kwargs["video_path"]) or PublishResult(
+            success=True,
+            feed_id="feed-random",
+            share_url="https://pd.qq.com/random",
+        ),
+    )
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["content_id"] == "second"
+    assert captured == [second_video]
+
+
 def test_publish_applies_title_exclusions_before_templates(tmp_path: Path, monkeypatch):
     video = tmp_path / "downloads" / "demo.mp4"
     video.parent.mkdir()

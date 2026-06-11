@@ -200,6 +200,8 @@ struct DownloadHistoryFile: Codable {
 
 struct PublishSettings: Codable {
     var input_dir: String = "./downloads"
+    var input_dirs: [String] = []
+    var selection_order: String = "sequential"
     var input_video: String = ""
     var account_id: String = ""
     var history_file: String = "./publish_history_mac.json"
@@ -218,7 +220,7 @@ struct PublishSettings: Codable {
     var retry_video_path: String = ""
 
     enum CodingKeys: String, CodingKey {
-        case input_dir, input_video, account_id, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
+        case input_dir, input_dirs, selection_order, input_video, account_id, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
         case title_template, content_template, strip_tags_mentions, title_exclusions, translate_title_zh_cn
         case delete_after_publish, retry_video_path
     }
@@ -228,6 +230,8 @@ struct PublishSettings: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         input_dir = try c.decodeIfPresent(String.self, forKey: .input_dir) ?? input_dir
+        input_dirs = try c.decodeIfPresent([String].self, forKey: .input_dirs) ?? input_dirs
+        selection_order = try c.decodeIfPresent(String.self, forKey: .selection_order) ?? selection_order
         input_video = try c.decodeIfPresent(String.self, forKey: .input_video) ?? input_video
         account_id = try c.decodeIfPresent(String.self, forKey: .account_id) ?? account_id
         history_file = try c.decodeIfPresent(String.self, forKey: .history_file) ?? history_file
@@ -1718,7 +1722,11 @@ final class AppModel: ObservableObject {
                 && (forceTaskID == task.id || isDue(lastScheduledRuns[task.id], minutes: task.interval_minutes)) {
             guard let directory = nextScheduledPublishDirectory(for: task) else { continue }
             lastScheduledRuns[task.id] = now
-            appendLog("执行定时发布: \(directory)")
+            appendLog(
+                task.order == "random"
+                    ? "执行定时发布: 从 \(task.directories.count) 个目录全局随机"
+                    : "执行定时发布: \(directory)"
+            )
             runScheduledPublish(task, directory: directory)
         }
     }
@@ -1755,7 +1763,7 @@ final class AppModel: ObservableObject {
         let directories = task.directories
         guard !directories.isEmpty else { return nil }
         if task.order == "random" {
-            return directories.randomElement()
+            return directories[0]
         }
         let index = nextPublishDirectoryIndexes[task.id, default: 0]
         let directory = directories[index % directories.count]
@@ -2159,6 +2167,8 @@ final class AppModel: ObservableObject {
     private func writeScheduledPublishSnapshot(_ task: ScheduledPublishTask, directory: String, retryVideoPath: String = "") throws -> URL {
         var snapshot = config
         snapshot.publish.input_dir = directory
+        snapshot.publish.input_dirs = task.order == "random" ? task.directories : [directory]
+        snapshot.publish.selection_order = task.order
         snapshot.publish.scope = task.scope
         snapshot.publish.guild_id = task.guild_id
         snapshot.publish.channel_id = task.channel_id
@@ -4167,7 +4177,7 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("\(task.directories.count) 个视频目录")
                                 .font(.headline)
-                            Text("\(task.order == "random" ? "随机发布" : "顺序发布") · 每 \(task.interval_minutes) 分钟执行")
+                            Text("\(task.order == "random" ? "所有目录全局随机" : "目录轮转顺序发布") · 每 \(task.interval_minutes) 分钟执行")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text("账号：\(model.config.tencent_accounts.first(where: { $0.id == task.account_id })?.displayName ?? "未选择")")
@@ -4388,7 +4398,7 @@ struct ContentView: View {
                                 Text("选取方式").font(.caption).foregroundStyle(.secondary)
                                 Picker("", selection: $schedulePublishOrderDraft) {
                                     Text("顺序发布").tag("sequential")
-                                    Text("随机发布").tag("random")
+                                    Text("全局随机").tag("random")
                                 }
                                 .pickerStyle(.segmented)
                             }
@@ -4396,6 +4406,11 @@ struct ContentView: View {
                             field("每天开始", text: $scheduleStartDraft)
                             field("每天结束", text: $scheduleEndDraft)
                         }
+                        Text(schedulePublishOrderDraft == "random"
+                            ? "递归汇总所有已选目录及其子目录中的视频，每次从整个候选池随机选择。"
+                            : "按目录轮转，并在每个目录中按文件时间顺序发布。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
 
                     panel {
