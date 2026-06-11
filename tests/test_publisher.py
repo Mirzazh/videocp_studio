@@ -9,10 +9,20 @@ from videocp.publisher import (
     MAX_CHANNEL_VIDEO_BYTES,
     _find_ffmpeg,
     _find_tencent_channel_cli,
+    _publish_env,
     is_retryable_publish_error,
     prepare_video_for_channel,
     publish_to_channel,
 )
+
+
+def test_publish_env_uses_selected_account_dotenv_over_inherited_token(tmp_path: Path, monkeypatch):
+    account_env = tmp_path / "account.env"
+    account_env.write_text("QQ_AI_CONNECT_TOKEN=token-for-account-b\n", encoding="utf-8")
+    monkeypatch.setenv("QQ_AI_CONNECT_TOKEN", "token-for-account-a")
+    monkeypatch.setenv("QQ_AI_CONNECT_DOTENV", str(account_env))
+
+    assert _publish_env()["QQ_AI_CONNECT_TOKEN"] == "token-for-account-b"
 
 
 def test_publish_to_channel_uses_author_scope_when_ids_are_blank(tmp_path: Path, monkeypatch):

@@ -182,6 +182,19 @@ def is_retryable_publish_error(error: str) -> bool:
 
 def _publish_env() -> dict[str, str]:
     env = {**os.environ}
+    dotenv_path = str(env.get("QQ_AI_CONNECT_DOTENV", "") or "").strip()
+    if dotenv_path:
+        try:
+            for raw_line in Path(dotenv_path).expanduser().read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() == "QQ_AI_CONNECT_TOKEN":
+                    env["QQ_AI_CONNECT_TOKEN"] = value.strip().strip("\"'")
+                    break
+        except OSError:
+            pass
     bundled_bin = env.get("VIDEOCP_BUNDLED_BIN", "")
     env["PATH"] = f"{bundled_bin}:/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "")
     return env

@@ -4,7 +4,7 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
-private let appVersion = "1.1.4"
+private let appVersion = "1.1.5"
 private let appReleaseAPIURL = URL(string: "https://api.github.com/repos/Mirzazh/videocp_studio/releases/latest")!
 private let appReleasePageURL = URL(string: "https://github.com/Mirzazh/videocp_studio/releases/latest")!
 
@@ -204,6 +204,7 @@ struct PublishSettings: Codable {
     var selection_order: String = "sequential"
     var input_video: String = ""
     var account_id: String = ""
+    var account_name: String = ""
     var history_file: String = "./publish_history_mac.json"
     var skill_dir: String = "~/.openclaw/workspace/skills/tencent-channel-community"
     var scope: String = "author_global"
@@ -220,7 +221,7 @@ struct PublishSettings: Codable {
     var retry_video_path: String = ""
 
     enum CodingKeys: String, CodingKey {
-        case input_dir, input_dirs, selection_order, input_video, account_id, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
+        case input_dir, input_dirs, selection_order, input_video, account_id, account_name, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
         case title_template, content_template, strip_tags_mentions, title_exclusions, translate_title_zh_cn
         case delete_after_publish, retry_video_path
     }
@@ -234,6 +235,7 @@ struct PublishSettings: Codable {
         selection_order = try c.decodeIfPresent(String.self, forKey: .selection_order) ?? selection_order
         input_video = try c.decodeIfPresent(String.self, forKey: .input_video) ?? input_video
         account_id = try c.decodeIfPresent(String.self, forKey: .account_id) ?? account_id
+        account_name = try c.decodeIfPresent(String.self, forKey: .account_name) ?? account_name
         history_file = try c.decodeIfPresent(String.self, forKey: .history_file) ?? history_file
         skill_dir = try c.decodeIfPresent(String.self, forKey: .skill_dir) ?? skill_dir
         scope = try c.decodeIfPresent(String.self, forKey: .scope) ?? scope
@@ -429,6 +431,13 @@ struct PublishHistoryEntry: Codable, Identifiable {
     var synced_at: String
     var status: String
     var error: String?
+    var account_id: String?
+    var account_name: String?
+
+    var displayAccountName: String {
+        let name = (account_name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "历史账号未标记" : name
+    }
 
     var isPublishSuccess: Bool {
         status == "ok" && !share_url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1504,7 +1513,10 @@ final class AppModel: ObservableObject {
         // already-verified global login state.
         if token.isEmpty { return [:] }
         let url = try credentialURL(for: accountID, token: token)
-        return ["QQ_AI_CONNECT_DOTENV": url.path]
+        return [
+            "QQ_AI_CONNECT_DOTENV": url.path,
+            "QQ_AI_CONNECT_TOKEN": token,
+        ]
     }
 
     private func legacyTencentToken() -> String {
@@ -1629,10 +1641,14 @@ final class AppModel: ObservableObject {
         do {
             let videoURL = URL(fileURLWithPath: expanded)
             let directory = videoURL.deletingLastPathComponent().path
+            let recordedAccountID = (entry.account_id ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let retryAccountID = config.tencent_accounts.contains(where: { $0.id == recordedAccountID })
+                ? recordedAccountID
+                : config.publish.account_id
             let task = ScheduledPublishTask(
                 id: retryID,
                 directories: [directory],
-                account_id: config.publish.account_id,
+                account_id: retryAccountID,
                 interval_minutes: 1,
                 order: "sequential",
                 scope: config.publish.scope,
@@ -2169,6 +2185,8 @@ final class AppModel: ObservableObject {
         snapshot.publish.input_dir = directory
         snapshot.publish.input_dirs = task.order == "random" ? task.directories : [directory]
         snapshot.publish.selection_order = task.order
+        snapshot.publish.account_id = task.account_id
+        snapshot.publish.account_name = config.tencent_accounts.first(where: { $0.id == task.account_id })?.displayName ?? ""
         snapshot.publish.scope = task.scope
         snapshot.publish.guild_id = task.guild_id
         snapshot.publish.channel_id = task.channel_id
@@ -3003,6 +3021,7 @@ struct ContentView: View {
     @State private var downloadHistoryProfile: DownloadProfile?
     @State private var publishHistoryPage = 0
     @State private var publishHistoryFilter = "all"
+    @State private var publishHistoryAccountFilter = "all"
     @State private var publishHistoryJumpText = ""
     @State private var showTencentTokenSettings = false
     @State private var showLogSearch = false
@@ -3968,11 +3987,12 @@ struct ContentView: View {
                         .pickerStyle(.segmented)
                     }
                 }
-                HStack(spacing: 12) {
-                    field("频道ID", text: $model.config.publish.guild_id)
-                    field("版块ID", text: $model.config.publish.channel_id)
+                if model.config.publish.scope == "channel" {
+                    HStack(spacing: 12) {
+                        field("频道 ID", text: $model.config.publish.guild_id)
+                        field("子频道 ID", text: $model.config.publish.channel_id)
+                    }
                 }
-                .disabled(model.config.publish.scope != "channel")
             }
             panel {
                 Label("帖子规则", systemImage: "slider.horizontal.3")
@@ -4011,7 +4031,10 @@ struct ContentView: View {
 
     private var publishHistoryPanel: some View {
         let filtered = model.publishHistory.filter { entry in
-            publishHistoryFilter == "all" || entry.displayStatus == publishHistoryFilter
+            let statusMatches = publishHistoryFilter == "all" || entry.displayStatus == publishHistoryFilter
+            let accountMatches = publishHistoryAccountFilter == "all"
+                || entry.account_id == publishHistoryAccountFilter
+            return statusMatches && accountMatches
         }
         let pageSize = 10
         let pageCount = max(1, Int(ceil(Double(filtered.count) / Double(pageSize))))
@@ -4028,6 +4051,14 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                Picker("账号", selection: $publishHistoryAccountFilter) {
+                    Text("全部账号").tag("all")
+                    ForEach(model.config.tencent_accounts) { account in
+                        Text(account.displayName).tag(account.id)
+                    }
+                }
+                .frame(width: 170)
+                .onChange(of: publishHistoryAccountFilter) { publishHistoryPage = 0 }
                 Picker("", selection: $publishHistoryFilter) {
                     Text("全部").tag("all")
                     Text("成功").tag("ok")
@@ -4062,7 +4093,9 @@ struct ContentView: View {
                             Text(entry.desc.isEmpty ? entry.content_id : entry.desc)
                                 .font(.caption)
                                 .lineLimit(1)
-                            Text(entry.isPublishSuccess ? entry.displayTime : "\(entry.displayTime) · \(entry.displayError)")
+                            Text(entry.isPublishSuccess
+                                ? "\(entry.displayAccountName) · \(entry.displayTime)"
+                                : "\(entry.displayAccountName) · \(entry.displayTime) · \(entry.displayError)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -4479,11 +4512,12 @@ struct ContentView: View {
                             }
                             intField("每次发布", value: $schedulePublishLimitDraft)
                         }
-                        HStack(spacing: 12) {
-                            field("频道 ID", text: $schedulePublishGuildIDDraft)
-                            field("版块 ID", text: $schedulePublishChannelIDDraft)
+                        if schedulePublishScopeDraft == "channel" {
+                            HStack(spacing: 12) {
+                                field("频道 ID", text: $schedulePublishGuildIDDraft)
+                                field("子频道 ID", text: $schedulePublishChannelIDDraft)
+                            }
                         }
-                        .disabled(schedulePublishScopeDraft != "channel")
                     }
 
                     panel {

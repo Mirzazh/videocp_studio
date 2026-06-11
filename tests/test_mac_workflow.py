@@ -530,6 +530,45 @@ def test_publish_random_order_uses_global_pool_across_directories(tmp_path: Path
     assert captured == [second_video]
 
 
+def test_publish_history_records_selected_account(tmp_path: Path, monkeypatch):
+    video = tmp_path / "downloads" / "demo.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    video.with_suffix(".json").write_text(json.dumps({"content_id": "account-video"}), encoding="utf-8")
+    history_path = tmp_path / "history.json"
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(video.parent),
+                    "history_file": str(history_path),
+                    "account_id": "account-b",
+                    "account_name": "账号 B",
+                    "delete_after_publish": False,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "videocp.mac_workflow.publish_to_channel",
+        lambda **kwargs: PublishResult(
+            success=True,
+            feed_id="feed-account-b",
+            share_url="https://pd.qq.com/account-b",
+        ),
+    )
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["ok"] is True
+    entry = json.loads(history_path.read_text(encoding="utf-8"))["entries"][0]
+    assert entry["account_id"] == "account-b"
+    assert entry["account_name"] == "账号 B"
+
+
 def test_publish_applies_title_exclusions_before_templates(tmp_path: Path, monkeypatch):
     video = tmp_path / "downloads" / "demo.mp4"
     video.parent.mkdir()

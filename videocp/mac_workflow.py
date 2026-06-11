@@ -485,6 +485,8 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
     translate_title_zh_cn = _as_bool(publish_raw.get("translate_title_zh_cn"), False)
     delete_after_publish = _as_bool(publish_raw.get("delete_after_publish"), True)
     retry_count = max(0, min(5, int(publish_raw.get("retry_count") or 2)))
+    account_id = str(publish_raw.get("account_id") or "").strip()
+    account_name = str(publish_raw.get("account_name") or "").strip()
     title_template = str(publish_raw.get("title_template") or "{title}")
     content_template = str(publish_raw.get("content_template") or "{title}")
     retry_video_path = str(publish_raw.get("retry_video_path") or "").strip()
@@ -520,7 +522,7 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
         sidecar = _sidecar_for_video(video_path)
         content_id = str(sidecar.get("content_id") or video_path.stem)
         task_name = "directory_publish"
-        if not retry_video_path and find_processed_entry(history, task_name, content_id) is not None:
+        if not retry_video_path and find_processed_entry(history, task_name, content_id, account_id) is not None:
             action = "skipped"
             if delete_after_publish:
                 video_path.unlink(missing_ok=True)
@@ -549,6 +551,8 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
                         output_path=str(video_path),
                         status="failed",
                         error=error,
+                        account_id=account_id,
+                        account_name=account_name,
                     ),
                 )
                 payload.append(
@@ -633,6 +637,8 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
                     output_path=str(video_path),
                     status="failed",
                     error=result.error,
+                    account_id=account_id,
+                    account_name=account_name,
                 ),
             )
             payload.append(
@@ -651,6 +657,8 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
                 feed_id=result.feed_id,
                 share_url=result.share_url,
                 status="ok",
+                account_id=account_id,
+                account_name=account_name,
             ),
         )
         if delete_after_publish:

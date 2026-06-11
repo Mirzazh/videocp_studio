@@ -22,6 +22,8 @@ class SyncHistoryEntry:
     synced_at: str = ""
     status: str = "ok"
     error: str = ""
+    account_id: str = ""
+    account_name: str = ""
 
 
 @dataclass(slots=True)
@@ -51,10 +53,23 @@ def is_synced(history: SyncHistory, task_name: str, content_id: str) -> bool:
     )
 
 
-def find_processed_entry(history: SyncHistory, task_name: str, content_id: str) -> SyncHistoryEntry | None:
+def find_processed_entry(
+    history: SyncHistory,
+    task_name: str,
+    content_id: str,
+    account_id: str = "",
+) -> SyncHistoryEntry | None:
     final_statuses = {"ok", "skipped_unavailable", "skipped_random", "skipped_duration"}
     for entry in reversed(history.entries):
-        if entry.task_name == task_name and entry.content_id == content_id and entry.status in final_statuses:
+        # Older history files did not record an account. Keep those entries
+        # effective for deduplication while new records remain account-scoped.
+        account_matches = not account_id or not entry.account_id or entry.account_id == account_id
+        if (
+            entry.task_name == task_name
+            and entry.content_id == content_id
+            and entry.status in final_statuses
+            and account_matches
+        ):
             return entry
     return None
 
@@ -71,6 +86,7 @@ def add_entry(history: SyncHistory, entry: SyncHistoryEntry) -> None:
             existing.task_name == entry.task_name
             and existing.content_id == entry.content_id
             and existing.status == entry.status
+            and existing.account_id == entry.account_id
             for existing in latest.entries
         ):
             latest.entries.append(entry)
@@ -94,6 +110,7 @@ def replace_entry(history: SyncHistory, entry: SyncHistoryEntry) -> None:
                 existing.task_name == entry.task_name
                 and existing.content_id == entry.content_id
                 and existing.status == entry.status
+                and existing.account_id == entry.account_id
             )
         ]
         latest.entries.append(entry)
