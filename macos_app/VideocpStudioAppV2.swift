@@ -4,7 +4,7 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
-private let appVersion = "1.1.3"
+private let appVersion = "1.1.4"
 private let appReleaseAPIURL = URL(string: "https://api.github.com/repos/Mirzazh/videocp_studio/releases/latest")!
 private let appReleasePageURL = URL(string: "https://github.com/Mirzazh/videocp_studio/releases/latest")!
 
@@ -826,44 +826,73 @@ final class AppModel: ObservableObject {
         request.setValue("Videocp-Studio/\(appVersion)", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.checkingUpdate = false
-                if let error {
-                    self.updateStatusText = "检查更新失败"
-                    if !silent {
-                        self.reportIssue("检查更新失败：\(error.localizedDescription)")
-                    }
-                    return
-                }
-                guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                      let data,
-                      let release = try? JSONDecoder().decode(GitHubReleaseResponse.self, from: data) else {
-                    self.updateStatusText = "检查更新失败"
-                    if !silent {
-                        self.reportIssue("检查更新失败：无法读取 GitHub Release 信息")
-                    }
-                    return
-                }
+            guard let self else { return }
+            if error == nil,
+               let http = response as? HTTPURLResponse,
+               (200..<300).contains(http.statusCode),
+               let data,
+               let release = try? JSONDecoder().decode(GitHubReleaseResponse.self, from: data) {
+                self.finishUpdateCheck(
+                    version: release.tag_name,
+                    releaseURL: URL(string: release.html_url),
+                    silent: silent
+                )
+                return
+            }
+            self.checkForUpdatesFromReleasePage(silent: silent, apiError: error)
+        }.resume()
+    }
 
-                let latest = release.tag_name.trimmingCharacters(in: .whitespacesAndNewlines)
-                let normalizedLatest = self.normalizedVersion(latest)
-                self.latestVersion = normalizedLatest
-                self.latestReleaseURL = URL(string: release.html_url) ?? appReleasePageURL
-
-                if self.isVersion(normalizedLatest, newerThan: appVersion) {
-                    self.updateAvailable = true
-                    self.updateStatusText = "发现新版本 \(normalizedLatest)"
-                    self.reportInfo("发现新版本 \(normalizedLatest)，可以点击“打开更新”下载。")
-                } else {
-                    self.updateAvailable = false
-                    self.updateStatusText = "已是最新版"
-                    if !silent {
-                        self.reportInfo("当前已是最新版 \(appVersion)")
-                    }
+    private func checkForUpdatesFromReleasePage(silent: Bool, apiError: Error?) {
+        var request = URLRequest(url: appReleasePageURL)
+        request.timeoutInterval = 15
+        request.setValue("Videocp-Studio/\(appVersion)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            let finalURL = response?.url
+            let redirectedTag = finalURL?.pathComponents.last(where: { $0.hasPrefix("v") })
+            var pageTag = redirectedTag
+            if pageTag == nil, let data, let html = String(data: data, encoding: .utf8) {
+                let range = NSRange(html.startIndex..<html.endIndex, in: html)
+                if let regex = try? NSRegularExpression(pattern: #"/releases/tag/(v?\d+\.\d+\.\d+)"#),
+                   let match = regex.firstMatch(in: html, range: range),
+                   let versionRange = Range(match.range(at: 1), in: html) {
+                    pageTag = String(html[versionRange])
                 }
             }
+            guard let pageTag, !pageTag.isEmpty else {
+                DispatchQueue.main.async {
+                    self.checkingUpdate = false
+                    self.updateStatusText = "检查更新失败"
+                    if !silent {
+                        let detail = error?.localizedDescription ?? apiError?.localizedDescription ?? "无法连接 GitHub Release"
+                        self.reportIssue("检查更新失败：\(detail)。可点击“打开更新”直接查看发布页。")
+                    }
+                }
+                return
+            }
+            self.finishUpdateCheck(version: pageTag, releaseURL: finalURL, silent: silent)
         }.resume()
+    }
+
+    private func finishUpdateCheck(version: String, releaseURL: URL?, silent: Bool) {
+        DispatchQueue.main.async {
+            let normalizedLatest = self.normalizedVersion(version.trimmingCharacters(in: .whitespacesAndNewlines))
+            self.checkingUpdate = false
+            self.latestVersion = normalizedLatest
+            self.latestReleaseURL = releaseURL ?? appReleasePageURL
+            if self.isVersion(normalizedLatest, newerThan: appVersion) {
+                self.updateAvailable = true
+                self.updateStatusText = "发现新版本 \(normalizedLatest)"
+                self.reportInfo("发现新版本 \(normalizedLatest)，可以点击“打开更新”下载。")
+            } else {
+                self.updateAvailable = false
+                self.updateStatusText = "已是最新版"
+                if !silent {
+                    self.reportInfo("当前已是最新版 \(appVersion)")
+                }
+            }
+        }
     }
 
     func openLatestRelease() {
@@ -1462,10 +1491,14 @@ final class AppModel: ObservableObject {
     }
 
     private func credentialEnvironment(for accountID: String) throws -> [String: String] {
-        let token = tokenForAccount(accountID)
-        guard !token.isEmpty else {
-            throw NSError(domain: "VideocpStudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "频道账号 Token 不存在"])
+        guard config.tencent_accounts.contains(where: { $0.id == accountID }) else {
+            throw NSError(domain: "VideocpStudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "频道账号不存在"])
         }
+        let token = tokenForAccount(accountID)
+        // Legacy installations may keep the credential in the CLI's own
+        // dotenv/keychain. An empty account token intentionally uses that
+        // already-verified global login state.
+        if token.isEmpty { return [:] }
         let url = try credentialURL(for: accountID, token: token)
         return ["QQ_AI_CONNECT_DOTENV": url.path]
     }
@@ -1519,7 +1552,7 @@ final class AppModel: ObservableObject {
             reportIssue("请先选择要发布的 MP4 视频")
             return
         }
-        guard !config.publish.account_id.isEmpty, !tokenForAccount(config.publish.account_id).isEmpty else {
+        guard config.tencent_accounts.contains(where: { $0.id == config.publish.account_id }) else {
             reportIssue("请先选择一个已验证的频道账号")
             return
         }
@@ -1552,8 +1585,7 @@ final class AppModel: ObservableObject {
             reportIssue("发布任务未选择频道账号")
             return
         }
-        let token = tokenForAccount(task.account_id)
-        guard !token.isEmpty else {
+        guard config.tencent_accounts.contains(where: { $0.id == task.account_id }) else {
             reportIssue("发布任务未选择有效的频道账号")
             return
         }
@@ -1612,8 +1644,7 @@ final class AppModel: ObservableObject {
                 delete_after_publish: config.publish.delete_after_publish
             )
             let snapshotURL = try writeScheduledPublishSnapshot(task, directory: directory, retryVideoPath: expanded)
-            let token = tokenForAccount(task.account_id)
-            guard !token.isEmpty else {
+            guard config.tencent_accounts.contains(where: { $0.id == task.account_id }) else {
                 reportIssue("请先选择一个已验证的频道账号")
                 return
             }
@@ -1901,6 +1932,7 @@ final class AppModel: ObservableObject {
             let source = response.token_source.isEmpty ? "未知来源" : response.token_source
             tencentStatusText = "\(name) · \(author)"
             tencentNickname = name
+            ensureTencentAccountForCurrentLogin(name: name, isAuthor: response.is_guild_author)
             if let index = config.tencent_accounts.firstIndex(where: { $0.id == config.publish.account_id }) {
                 config.tencent_accounts[index].nickname = name
                 config.tencent_accounts[index].is_guild_author = response.is_guild_author
@@ -1918,6 +1950,28 @@ final class AppModel: ObservableObject {
             }
         }
         suppressNextTencentFailureNotice = false
+    }
+
+    private func ensureTencentAccountForCurrentLogin(name: String, isAuthor: Bool) {
+        if config.publish.account_id.isEmpty, let first = config.tencent_accounts.first {
+            config.publish.account_id = first.id
+        }
+        if !config.tencent_accounts.isEmpty { return }
+        let token = legacyTencentToken()
+        let account = TencentAccount(
+            name: "",
+            token: token,
+            nickname: name == "当前账号" ? "" : name,
+            is_guild_author: isAuthor,
+            verified: true
+        )
+        config.tencent_accounts = [account]
+        config.publish.account_id = account.id
+        for index in config.automation.publish_tasks.indices
+        where config.automation.publish_tasks[index].account_id.isEmpty {
+            config.automation.publish_tasks[index].account_id = account.id
+        }
+        save()
     }
 
     private func runTencentCLI(_ arguments: [String], token: String = "") throws -> String {
@@ -3753,9 +3807,15 @@ struct ContentView: View {
                             }
                         }
                         if model.config.tencent_accounts.isEmpty {
-                            Text("还没有频道账号，请添加并验证 Token。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            if model.tencentStatusOK {
+                                Label(model.tencentStatusText, systemImage: "checkmark.seal.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(Color.green)
+                            } else {
+                                Text("还没有频道账号，请添加并验证 Token。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         } else {
                             ForEach(model.config.tencent_accounts) { account in
                                 HStack {
@@ -3778,7 +3838,7 @@ struct ContentView: View {
                                 }
                             }
                         }
-                        if showTencentTokenSettings || model.config.tencent_accounts.isEmpty {
+                        if showTencentTokenSettings || (model.config.tencent_accounts.isEmpty && !model.tencentStatusOK) {
                             HStack(spacing: 5) {
                                 Text("还没有 Token？")
                                     .foregroundStyle(.secondary)
@@ -3805,7 +3865,7 @@ struct ContentView: View {
                         }
                     }
                 }
-                if !model.config.tencent_accounts.isEmpty || publishMode == .history {
+                if model.tencentStatusOK || !model.config.tencent_accounts.isEmpty || publishMode == .history {
                     switch publishMode {
                     case .single:
                         singlePublishPanel
