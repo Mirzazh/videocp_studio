@@ -638,3 +638,53 @@ def test_app_bilibili_short_playlist_result_is_filled_by_browser(monkeypatch):
     assert len(result) == 40
     assert result[25].canonical_url == "https://www.bilibili.com/video/BV026"
     assert result[-1].canonical_url == "https://www.bilibili.com/video/BV040"
+
+
+def test_app_xiaohongshu_profile_videos_use_single_video_ytdlp_path(monkeypatch):
+    profile = ParsedInput(
+        raw_input="https://www.xiaohongshu.com/user/profile/demo",
+        extracted_url="https://www.xiaohongshu.com/user/profile/demo",
+        canonical_url="https://www.xiaohongshu.com/user/profile/demo",
+        provider_key="xiaohongshu",
+        is_profile=True,
+    )
+    note_url = (
+        "https://www.xiaohongshu.com/explore/69be081c0000000021010b12"
+        "?xsec_token=token-demo&xsec_source=pc_user"
+    )
+    monkeypatch.setattr(
+        app,
+        "expand_profile",
+        lambda **kwargs: SimpleNamespace(
+            video_urls=[note_url],
+            pinned_urls=[],
+            author="章鱼科普1号",
+        ),
+    )
+
+    class FakePage:
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def new_page(self):
+            return FakePage()
+
+    monkeypatch.setattr(app, "open_download_browser_session", lambda config: FakeBrowser())
+
+    result = app._expand_profile_inputs(
+        [profile],
+        browser_config=SimpleNamespace(),
+        profile_videos_count=30,
+        timeout_secs=30,
+    )
+
+    assert result[0].provider_key == "ytdlp"
+    assert result[0].canonical_url == note_url
+    assert result[0].author_hint == "章鱼科普1号"

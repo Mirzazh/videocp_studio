@@ -4,7 +4,7 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
-private let appVersion = "1.1.5"
+private let appVersion = "1.1.6"
 private let appReleaseAPIURL = URL(string: "https://api.github.com/repos/Mirzazh/videocp_studio/releases/latest")!
 private let appReleasePageURL = URL(string: "https://github.com/Mirzazh/videocp_studio/releases/latest")!
 
@@ -205,6 +205,7 @@ struct PublishSettings: Codable {
     var input_video: String = ""
     var account_id: String = ""
     var account_name: String = ""
+    var account_nickname: String = ""
     var history_file: String = "./publish_history_mac.json"
     var skill_dir: String = "~/.openclaw/workspace/skills/tencent-channel-community"
     var scope: String = "author_global"
@@ -221,7 +222,7 @@ struct PublishSettings: Codable {
     var retry_video_path: String = ""
 
     enum CodingKeys: String, CodingKey {
-        case input_dir, input_dirs, selection_order, input_video, account_id, account_name, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
+        case input_dir, input_dirs, selection_order, input_video, account_id, account_name, account_nickname, history_file, skill_dir, scope, guild_id, channel_id, feed_type, limit
         case title_template, content_template, strip_tags_mentions, title_exclusions, translate_title_zh_cn
         case delete_after_publish, retry_video_path
     }
@@ -236,6 +237,7 @@ struct PublishSettings: Codable {
         input_video = try c.decodeIfPresent(String.self, forKey: .input_video) ?? input_video
         account_id = try c.decodeIfPresent(String.self, forKey: .account_id) ?? account_id
         account_name = try c.decodeIfPresent(String.self, forKey: .account_name) ?? account_name
+        account_nickname = try c.decodeIfPresent(String.self, forKey: .account_nickname) ?? account_nickname
         history_file = try c.decodeIfPresent(String.self, forKey: .history_file) ?? history_file
         skill_dir = try c.decodeIfPresent(String.self, forKey: .skill_dir) ?? skill_dir
         scope = try c.decodeIfPresent(String.self, forKey: .scope) ?? scope
@@ -637,6 +639,8 @@ final class AppModel: ObservableObject {
     @Published var latestVersion: String = ""
     @Published var latestReleaseURL: URL = appReleasePageURL
     @Published var checkingUpdate = false
+    @Published var profileLocalVideoCounts: [String: Int] = [:]
+    @Published var refreshingLocalVideoCounts = false
 
     let appRoot: URL
     let configURL: URL
@@ -659,6 +663,7 @@ final class AppModel: ObservableObject {
     private var historyRedownloadOutputs: [String: String] = [:]
     private var suppressNextTencentFailureNotice = false
     private var didAutoCheckUpdate = false
+    private var localVideoCountRefreshPending = false
     private var logLines: [String] = []
     private let maxVisibleLogLines = 100
     private let maxVisibleLogLineLength = 1200
@@ -691,6 +696,7 @@ final class AppModel: ObservableObject {
         migrateLegacyTencentAccount()
         validateBundledRuntime()
         loadPublishHistory()
+        refreshLocalVideoCounts()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
             self?.checkTencentChannel(silent: true)
         }
@@ -946,6 +952,7 @@ final class AppModel: ObservableObject {
                 config.publish.input_dir = path
             }
             save()
+            refreshLocalVideoCounts(force: true)
         }
     }
 
@@ -1233,6 +1240,7 @@ final class AppModel: ObservableObject {
     func deleteProfile(_ profile: DownloadProfile) {
         config.download.profiles.removeAll { $0.id == profile.id }
         profileProgress.removeValue(forKey: profile.id)
+        profileLocalVideoCounts.removeValue(forKey: profile.id)
         save()
         appendLog("已删除主页: \(profile.name.isEmpty ? profile.url : profile.name)")
     }
@@ -1368,6 +1376,7 @@ final class AppModel: ObservableObject {
             config.download.profile_url_draft = ""
         }
         save()
+        refreshLocalVideoCounts(force: true)
         reportInfo("已添加 UP 主：\(profile.name)")
         return true
     }
@@ -1466,10 +1475,12 @@ final class AppModel: ObservableObject {
     }
 
     func deleteTencentAccount(_ account: TencentAccount) {
-        let credential = configURL.deletingLastPathComponent()
+        let accountsDirectory = configURL.deletingLastPathComponent()
             .appendingPathComponent("accounts")
-            .appendingPathComponent("\(account.id).env")
-        try? FileManager.default.removeItem(at: credential)
+        let legacyCredential = accountsDirectory.appendingPathComponent("\(account.id).env")
+        let isolatedHome = accountsDirectory.appendingPathComponent(account.id, isDirectory: true)
+        try? FileManager.default.removeItem(at: legacyCredential)
+        try? FileManager.default.removeItem(at: isolatedHome)
         config.tencent_accounts.removeAll { $0.id == account.id }
         if config.publish.account_id == account.id {
             config.publish.account_id = config.tencent_accounts.first?.id ?? ""
@@ -1483,24 +1494,26 @@ final class AppModel: ObservableObject {
     }
 
     func tokenForAccount(_ accountID: String) -> String {
-        if let token = config.tencent_accounts.first(where: { $0.id == accountID })?.token, !token.isEmpty {
-            return token
-        }
-        return legacyTencentToken()
+        config.tencent_accounts.first(where: { $0.id == accountID })?.token
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    private func credentialURL(for accountID: String, token: String) throws -> URL {
-        let directory = configURL.deletingLastPathComponent().appendingPathComponent("accounts", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    private func credentialURLs(for accountID: String, token: String) throws -> (dotenv: URL, home: URL) {
+        let accountsDirectory = configURL.deletingLastPathComponent().appendingPathComponent("accounts", isDirectory: true)
         let safeID = accountID.replacingOccurrences(
             of: "[^A-Za-z0-9._-]",
             with: "-",
             options: .regularExpression
         )
-        let url = directory.appendingPathComponent("\(safeID).env")
-        try "QQ_AI_CONNECT_TOKEN=\(token)\n".write(to: url, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        return url
+        let home = accountsDirectory.appendingPathComponent(safeID, isDirectory: true)
+        let qqcliDirectory = home.appendingPathComponent(".qqcli", isDirectory: true)
+        let dotenv = qqcliDirectory.appendingPathComponent(".env")
+        try FileManager.default.createDirectory(at: qqcliDirectory, withIntermediateDirectories: true)
+        try "QQ_AI_CONNECT_TOKEN=\(token)\n".write(to: dotenv, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: qqcliDirectory.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dotenv.path)
+        return (dotenv, home)
     }
 
     private func credentialEnvironment(for accountID: String) throws -> [String: String] {
@@ -1508,14 +1521,18 @@ final class AppModel: ObservableObject {
             throw NSError(domain: "VideocpStudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "频道账号不存在"])
         }
         let token = tokenForAccount(accountID)
-        // Legacy installations may keep the credential in the CLI's own
-        // dotenv/keychain. An empty account token intentionally uses that
-        // already-verified global login state.
-        if token.isEmpty { return [:] }
-        let url = try credentialURL(for: accountID, token: token)
+        guard !token.isEmpty else {
+            throw NSError(
+                domain: "VideocpStudio",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "所选频道账号缺少 Token，请删除后重新添加该账号"]
+            )
+        }
+        let urls = try credentialURLs(for: accountID, token: token)
         return [
-            "QQ_AI_CONNECT_DOTENV": url.path,
+            "QQ_AI_CONNECT_DOTENV": urls.dotenv.path,
             "QQ_AI_CONNECT_TOKEN": token,
+            "VIDEOCP_QQCLI_HOME": urls.home.path,
         ]
     }
 
@@ -1554,7 +1571,11 @@ final class AppModel: ObservableObject {
         if silent && busy { return }
         suppressNextTencentFailureNotice = silent
         appendLog("检查腾讯频道登录状态")
-        runTencentStatus(arguments: ["app-tencent-setup", "--check", "--json"])
+        let selectedToken = tokenForAccount(config.publish.account_id)
+        runTencentStatus(
+            arguments: ["app-tencent-setup", "--check", "--json"],
+            extraEnvironment: selectedToken.isEmpty ? [:] : ["QQ_AI_CONNECT_ACCOUNT_TOKEN": selectedToken]
+        )
     }
 
     func runPublish() {
@@ -1897,12 +1918,15 @@ final class AppModel: ObservableObject {
         tencentStatusText = "正在验证"
         tencentStatusOK = false
         let tokenWasProvided = !(extraEnvironment["QQ_AI_CONNECT_TOKEN_INPUT"] ?? "").isEmpty
+        let accountToken = extraEnvironment["QQ_AI_CONNECT_ACCOUNT_TOKEN"] ?? ""
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                if let token = extraEnvironment["QQ_AI_CONNECT_TOKEN_INPUT"], !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    try self.writeTencentToken(token)
+                let inputToken = extraEnvironment["QQ_AI_CONNECT_TOKEN_INPUT"] ?? ""
+                if !inputToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    try self.writeTencentToken(inputToken)
                 }
-                let statusOutput = try self.runTencentCLI(["login", "status", "--json"])
+                let verificationToken = inputToken.isEmpty ? accountToken : inputToken
+                let statusOutput = try self.runTencentCLI(["login", "status", "--json"], token: verificationToken)
                 let status = try JSONDecoder().decode(TencentCLIStatus.self, from: Data(statusOutput.utf8))
                 let loggedIn = status.success && (status.data.valid == true || status.data.isLoggedIn == true)
                 var response = TencentStatusResponse(
@@ -1915,7 +1939,7 @@ final class AppModel: ObservableObject {
                     error: loggedIn ? "" : "腾讯频道 Token 未配置或未通过登录检查"
                 )
                 if loggedIn {
-                    let userOutput = try self.runTencentCLI(["manage", "get-user-info", "--json"])
+                    let userOutput = try self.runTencentCLI(["manage", "get-user-info", "--json"], token: verificationToken)
                     let user = try JSONDecoder().decode(TencentCLIUser.self, from: Data(userOutput.utf8))
                     if user.success {
                         response.nickname = user.data.nickname ?? ""
@@ -2016,16 +2040,30 @@ final class AppModel: ObservableObject {
         process.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
+        for key in [
+            "QQ_AI_CONNECT_TOKEN",
+            "QQ_AI_CONNECT_DOTENV",
+            "QQ_AI_CONNECT_MCP_URL",
+            "QQ_AI_CONNECT_MCP_ENV",
+            "QQ_AI_CONNECT_DEVICE_ID",
+        ] {
+            environment.removeValue(forKey: key)
+        }
         environment["PATH"] = "\(bundledBin):/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "")
         environment["VIDEOCP_BUNDLED_BIN"] = bundledBin
-        var temporaryCredentialURL: URL?
+        var temporaryCredentialHome: URL?
         if !token.isEmpty {
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("videocp-account-\(UUID().uuidString).env")
-            try "QQ_AI_CONNECT_TOKEN=\(token)\n".write(to: url, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-            environment["QQ_AI_CONNECT_DOTENV"] = url.path
-            temporaryCredentialURL = url
+            let home = FileManager.default.temporaryDirectory
+                .appendingPathComponent("videocp-account-\(UUID().uuidString)", isDirectory: true)
+            let qqcliDirectory = home.appendingPathComponent(".qqcli", isDirectory: true)
+            let dotenv = qqcliDirectory.appendingPathComponent(".env")
+            try FileManager.default.createDirectory(at: qqcliDirectory, withIntermediateDirectories: true)
+            try "QQ_AI_CONNECT_TOKEN=\(token)\n".write(to: dotenv, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dotenv.path)
+            environment["HOME"] = home.path
+            environment["QQ_AI_CONNECT_TOKEN"] = token
+            environment["QQ_AI_CONNECT_DOTENV"] = dotenv.path
+            temporaryCredentialHome = home
         }
         process.environment = environment
         let pipe = Pipe()
@@ -2033,8 +2071,8 @@ final class AppModel: ObservableObject {
         process.standardError = pipe
         try process.run()
         process.waitUntilExit()
-        if let temporaryCredentialURL {
-            try? FileManager.default.removeItem(at: temporaryCredentialURL)
+        if let temporaryCredentialHome {
+            try? FileManager.default.removeItem(at: temporaryCredentialHome)
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
@@ -2112,6 +2150,16 @@ final class AppModel: ObservableObject {
         environment["DENO_NO_PROMPT"] = "1"
         environment["DENO_NO_UPDATE_CHECK"] = "1"
         environment["HOME"] = NSHomeDirectory()
+        for key in [
+            "QQ_AI_CONNECT_TOKEN",
+            "QQ_AI_CONNECT_DOTENV",
+            "QQ_AI_CONNECT_MCP_URL",
+            "QQ_AI_CONNECT_MCP_ENV",
+            "QQ_AI_CONNECT_DEVICE_ID",
+            "VIDEOCP_QQCLI_HOME",
+        ] {
+            environment.removeValue(forKey: key)
+        }
         for (key, value) in extraEnvironment {
             environment[key] = value
         }
@@ -2186,7 +2234,9 @@ final class AppModel: ObservableObject {
         snapshot.publish.input_dirs = task.order == "random" ? task.directories : [directory]
         snapshot.publish.selection_order = task.order
         snapshot.publish.account_id = task.account_id
-        snapshot.publish.account_name = config.tencent_accounts.first(where: { $0.id == task.account_id })?.displayName ?? ""
+        let account = config.tencent_accounts.first(where: { $0.id == task.account_id })
+        snapshot.publish.account_name = account?.displayName ?? ""
+        snapshot.publish.account_nickname = account?.nickname ?? ""
         snapshot.publish.scope = task.scope
         snapshot.publish.guild_id = task.guild_id
         snapshot.publish.channel_id = task.channel_id
@@ -2454,7 +2504,32 @@ final class AppModel: ObservableObject {
             publishHistory = []
             return
         }
-        publishHistory = file.entries.sorted { $0.synced_at > $1.synced_at }
+        let downloadedTitles = Dictionary(
+            downloadHistoryEntries()
+                .filter { !$0.content_id.isEmpty && !$0.desc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .map { ($0.content_id, $0.desc) },
+            uniquingKeysWith: { newer, _ in newer }
+        )
+        publishHistory = file.entries.map { original in
+            var entry = original
+            let currentTitle = entry.desc.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard currentTitle.isEmpty || currentTitle == entry.content_id else { return entry }
+            let mediaPath = (entry.output_path as NSString).expandingTildeInPath
+            let sidecarURL = URL(fileURLWithPath: mediaPath).deletingPathExtension().appendingPathExtension("json")
+            if let sidecarData = try? Data(contentsOf: sidecarURL),
+               let sidecar = try? JSONSerialization.jsonObject(with: sidecarData) as? [String: Any] {
+                let title = String(describing: sidecar["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty {
+                    entry.desc = title
+                    return entry
+                }
+            }
+            if let recovered = downloadedTitles[entry.content_id], !recovered.isEmpty {
+                entry.desc = recovered
+            }
+            return entry
+        }
+        .sorted { $0.synced_at > $1.synced_at }
     }
 
     private func resolvedSupportPath(_ value: String) -> URL {
@@ -2523,6 +2598,35 @@ final class AppModel: ObservableObject {
     }
 
     func localVideoCount(for profile: DownloadProfile) -> Int {
+        profileLocalVideoCounts[profile.id] ?? 0
+    }
+
+    func refreshLocalVideoCounts(force: Bool = false) {
+        guard !localVideoCountRefreshPending else { return }
+        guard force || profileLocalVideoCounts.isEmpty else { return }
+        guard !config.download.profiles.isEmpty else {
+            profileLocalVideoCounts = [:]
+            refreshingLocalVideoCounts = false
+            return
+        }
+        localVideoCountRefreshPending = true
+        refreshingLocalVideoCounts = true
+        let profiles = config.download.profiles
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            var counts: [String: Int] = [:]
+            for profile in profiles {
+                counts[profile.id] = self.computeLocalVideoCount(for: profile)
+            }
+            DispatchQueue.main.async {
+                self.profileLocalVideoCounts = counts
+                self.refreshingLocalVideoCounts = false
+                self.localVideoCountRefreshPending = false
+            }
+        }
+    }
+
+    private func computeLocalVideoCount(for profile: DownloadProfile) -> Int {
         struct LocalVideo {
             let contentID: String
             let site: String
@@ -2936,6 +3040,7 @@ final class AppModel: ObservableObject {
         }
         profileProgress[profileID] = progress
         completedDownloadJobsByProfile.removeValue(forKey: profileID)
+        refreshLocalVideoCounts(force: true)
     }
 
     private func updateSingleDownloadProgress(from output: String) {
@@ -3048,7 +3153,13 @@ struct ContentView: View {
         }
         .onAppear {
             model.startSchedulerMonitor()
+            model.refreshLocalVideoCounts()
             installLogSearchShortcut()
+        }
+        .onChange(of: section) {
+            if section == .download {
+                model.refreshLocalVideoCounts()
+            }
         }
         .onDisappear {
             removeLogSearchShortcut()
@@ -3395,6 +3506,13 @@ struct ContentView: View {
                 Text("\(model.config.download.profiles.count) 个来源")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if model.refreshingLocalVideoCounts {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在更新本地数量")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 requirementPill(text: model.downloadDirectoryReady ? "可开始下载" : "先选择保存位置", ok: model.downloadDirectoryReady)
                 Spacer()
                 Button {

@@ -27,6 +27,22 @@ class PublishResult:
     error: str = ""
 
 
+@dataclass(slots=True)
+class TencentAccountIdentity:
+    success: bool
+    nickname: str = ""
+    global_nickname: str = ""
+    error: str = ""
+
+    @property
+    def names(self) -> set[str]:
+        return {
+            value.strip()
+            for value in (self.nickname, self.global_nickname)
+            if value and value.strip()
+        }
+
+
 def _as_publish_scope_id(value: str) -> int:
     raw = str(value or "").strip()
     if not raw:
@@ -182,6 +198,9 @@ def is_retryable_publish_error(error: str) -> bool:
 
 def _publish_env() -> dict[str, str]:
     env = {**os.environ}
+    isolated_home = str(env.get("VIDEOCP_QQCLI_HOME", "") or "").strip()
+    if isolated_home:
+        env["HOME"] = str(Path(isolated_home).expanduser())
     dotenv_path = str(env.get("QQ_AI_CONNECT_DOTENV", "") or "").strip()
     if dotenv_path:
         try:
@@ -198,6 +217,40 @@ def _publish_env() -> dict[str, str]:
     bundled_bin = env.get("VIDEOCP_BUNDLED_BIN", "")
     env["PATH"] = f"{bundled_bin}:/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "")
     return env
+
+
+def get_tencent_account_identity(timeout_secs: int = 30) -> TencentAccountIdentity:
+    cli = _find_tencent_channel_cli()
+    if not cli:
+        return TencentAccountIdentity(success=False, error="未找到 tencent-channel-cli")
+    try:
+        proc = subprocess_run(
+            [cli, "manage", "get-user-info", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_secs,
+            env=_publish_env(),
+        )
+    except Exception as exc:
+        return TencentAccountIdentity(success=False, error=f"频道账号验证失败: {exc}")
+    if proc.returncode != 0:
+        return TencentAccountIdentity(
+            success=False,
+            error=(proc.stderr or proc.stdout or "频道账号验证失败").strip(),
+        )
+    try:
+        payload = json.loads((proc.stdout or "").strip())
+    except json.JSONDecodeError:
+        return TencentAccountIdentity(success=False, error="频道账号验证返回了无效数据")
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    if not isinstance(data, dict) or not payload.get("success"):
+        message = payload.get("error") if isinstance(payload, dict) else ""
+        return TencentAccountIdentity(success=False, error=str(message or "频道账号验证失败"))
+    return TencentAccountIdentity(
+        success=True,
+        nickname=str(data.get("nickname") or ""),
+        global_nickname=str(data.get("global_nickname") or ""),
+    )
 
 
 def is_login_state_publish_error(error: str) -> bool:

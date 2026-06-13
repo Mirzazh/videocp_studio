@@ -382,11 +382,16 @@ def _expand_profile_inputs(
                         author_hint=result.author,
                     ))
                 for url in result.video_urls:
+                    provider_key = (
+                        "ytdlp"
+                        if profile_input.provider_key == "xiaohongshu"
+                        else profile_input.provider_key
+                    )
                     expanded.append(ParsedInput(
                         raw_input=url,
                         extracted_url=url,
                         canonical_url=url,
-                        provider_key=profile_input.provider_key,
+                        provider_key=provider_key,
                         author_hint=result.author,
                     ))
 

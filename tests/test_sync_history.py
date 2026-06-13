@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from videocp.sync_history import SyncHistoryEntry, add_entry, find_processed_entry, load_history, replace_entry
+from videocp.sync_history import (
+    SyncHistoryEntry,
+    add_entry,
+    find_processed_entry,
+    load_history,
+    replace_content_entries,
+    replace_entry,
+)
 
 
 def _entry(content_id: str) -> SyncHistoryEntry:
@@ -85,3 +92,24 @@ def test_legacy_publish_record_without_account_still_prevents_duplicate(tmp_path
     add_entry(history, legacy)
 
     assert find_processed_entry(history, "directory_publish", "video-1", "account-b") is not None
+
+
+def test_replace_content_entries_removes_failed_retry_for_same_account(tmp_path: Path):
+    history = load_history(tmp_path / "history.json")
+    failed = _entry("video-1")
+    failed.task_name = "directory_publish"
+    failed.status = "failed"
+    failed.account_id = "account-b"
+    add_entry(history, failed)
+
+    success = _entry("video-1")
+    success.task_name = "directory_publish"
+    success.status = "ok"
+    success.account_id = "account-b"
+    success.share_url = "https://pd.qq.com/success"
+    replace_content_entries(history, success)
+
+    entries = load_history(history.path).entries
+    assert len(entries) == 1
+    assert entries[0].status == "ok"
+    assert entries[0].account_id == "account-b"

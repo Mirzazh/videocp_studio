@@ -11,7 +11,7 @@ from videocp.mac_workflow import (
     run_download_from_app_config,
     run_publish_from_app_config,
 )
-from videocp.publisher import PublishResult
+from videocp.publisher import PublishResult, TencentAccountIdentity
 from videocp.ytdlp import YtdlpPlaylistResult
 
 
@@ -168,6 +168,7 @@ def test_download_from_app_config_records_history_and_reuses_it_after_file_remov
     history = json.loads(history_path.read_text(encoding="utf-8"))
     assert history["entries"][0]["content_id"] == "cid-1"
     assert history["entries"][0]["task_name"] == "directory_download"
+    assert history["entries"][0]["desc"] == "title"
 
 
 def test_download_from_app_config_force_redownload_bypasses_history(tmp_path: Path, monkeypatch):
@@ -560,6 +561,10 @@ def test_publish_history_records_selected_account(tmp_path: Path, monkeypatch):
             share_url="https://pd.qq.com/account-b",
         ),
     )
+    monkeypatch.setattr(
+        "videocp.mac_workflow.get_tencent_account_identity",
+        lambda: TencentAccountIdentity(success=True, nickname="账号 B"),
+    )
 
     result = run_publish_from_app_config(config_path)
 
@@ -567,6 +572,86 @@ def test_publish_history_records_selected_account(tmp_path: Path, monkeypatch):
     entry = json.loads(history_path.read_text(encoding="utf-8"))["entries"][0]
     assert entry["account_id"] == "account-b"
     assert entry["account_name"] == "账号 B"
+
+
+def test_publish_stops_when_selected_account_identity_does_not_match(tmp_path: Path, monkeypatch):
+    video = tmp_path / "downloads" / "demo.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(video.parent),
+                    "account_id": "account-b",
+                    "account_name": "备注 B",
+                    "account_nickname": "账号 B",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "videocp.mac_workflow.get_tencent_account_identity",
+        lambda: TencentAccountIdentity(success=True, nickname="账号 A"),
+    )
+    published = []
+    monkeypatch.setattr("videocp.mac_workflow.publish_to_channel", lambda **kwargs: published.append(kwargs))
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["ok"] is False
+    assert "账号不匹配" in result[0]["error"]
+    assert "账号 A" in result[0]["error"]
+    assert published == []
+
+
+def test_publish_history_uses_actual_bilibili_title(tmp_path: Path, monkeypatch):
+    video = tmp_path / "downloads" / "BV1demo.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    video.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "content_id": "BV1demo",
+                "site": "bilibili",
+                "title": "B站真实视频标题",
+                "desc": "",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    history_path = tmp_path / "history.json"
+    config_path = tmp_path / "mac-app.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "publish": {
+                    "input_dir": str(video.parent),
+                    "history_file": str(history_path),
+                    "delete_after_publish": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "videocp.mac_workflow.publish_to_channel",
+        lambda **kwargs: PublishResult(
+            success=True,
+            feed_id="feed-bilibili",
+            share_url="https://pd.qq.com/bilibili",
+        ),
+    )
+
+    result = run_publish_from_app_config(config_path)
+
+    assert result[0]["title"] == "B站真实视频标题"
+    entry = json.loads(history_path.read_text(encoding="utf-8"))["entries"][0]
+    assert entry["desc"] == "B站真实视频标题"
 
 
 def test_publish_applies_title_exclusions_before_templates(tmp_path: Path, monkeypatch):
@@ -985,7 +1070,9 @@ def test_publish_retry_video_path_publishes_only_selected_failed_video(tmp_path:
     assert attempts[0]["video_path"] == video
     assert result[0]["action"] == "published"
     history = json.loads(history_path.read_text(encoding="utf-8"))
-    assert [entry["status"] for entry in history["entries"]] == ["ok", "failed", "ok"]
+    assert [entry["status"] for entry in history["entries"]] == ["ok", "ok"]
+    assert history["entries"][-1]["content_id"] == "cid-retry-one"
+    assert history["entries"][-1]["share_url"] == "https://pd.qq.com/new"
 
 
 def test_publish_final_failure_is_recorded_but_not_deduped_or_deleted(tmp_path: Path, monkeypatch):

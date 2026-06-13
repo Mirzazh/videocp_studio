@@ -10,6 +10,7 @@ from videocp.publisher import (
     _find_ffmpeg,
     _find_tencent_channel_cli,
     _publish_env,
+    get_tencent_account_identity,
     is_retryable_publish_error,
     prepare_video_for_channel,
     publish_to_channel,
@@ -23,6 +24,39 @@ def test_publish_env_uses_selected_account_dotenv_over_inherited_token(tmp_path:
     monkeypatch.setenv("QQ_AI_CONNECT_DOTENV", str(account_env))
 
     assert _publish_env()["QQ_AI_CONNECT_TOKEN"] == "token-for-account-b"
+
+
+def test_publish_env_uses_isolated_account_home(tmp_path: Path, monkeypatch):
+    account_home = tmp_path / "account-b"
+    monkeypatch.setenv("VIDEOCP_QQCLI_HOME", str(account_home))
+
+    assert _publish_env()["HOME"] == str(account_home)
+
+
+def test_get_tencent_account_identity_reads_cli_user(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("videocp.publisher._find_tencent_channel_cli", lambda: "/bin/tencent-channel-cli")
+    monkeypatch.setattr(
+        "videocp.publisher.subprocess_run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "nickname": "账号 B",
+                        "global_nickname": "账号 B",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            stderr="",
+        ),
+    )
+
+    identity = get_tencent_account_identity()
+
+    assert identity.success is True
+    assert identity.names == {"账号 B"}
 
 
 def test_publish_to_channel_uses_author_scope_when_ids_are_blank(tmp_path: Path, monkeypatch):

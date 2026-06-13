@@ -20,13 +20,21 @@ from videocp.profile_expander import expand_profile
 from videocp.publisher import (
     PublishResult,
     check_tencent_login_status,
+    get_tencent_account_identity,
     is_login_state_publish_error,
     is_retryable_publish_error,
     prepare_video_for_channel,
     publish_to_channel,
 )
 from videocp.runtime_log import log_warn
-from videocp.sync_history import SyncHistoryEntry, add_entry, find_processed_entry, load_history, replace_entry
+from videocp.sync_history import (
+    SyncHistoryEntry,
+    add_entry,
+    find_processed_entry,
+    load_history,
+    replace_content_entries,
+    replace_entry,
+)
 from videocp.ytdlp import YtdlpPlaylistResult, expand_ytdlp_playlist
 
 
@@ -225,7 +233,7 @@ def run_download_from_app_config(app_config_path: Path, *, force_redownload: boo
                 content_id=meta.content_id,
                 site=meta.site,
                 author=meta.author,
-                desc=meta.desc,
+                desc=meta.title or meta.desc,
                 output_path=str(item.artifact.output_path) if item.artifact else "",
                 status="ok",
             )
@@ -487,9 +495,33 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
     retry_count = max(0, min(5, int(publish_raw.get("retry_count") or 2)))
     account_id = str(publish_raw.get("account_id") or "").strip()
     account_name = str(publish_raw.get("account_name") or "").strip()
+    account_nickname = str(publish_raw.get("account_nickname") or "").strip()
     title_template = str(publish_raw.get("title_template") or "{title}")
     content_template = str(publish_raw.get("content_template") or "{title}")
     retry_video_path = str(publish_raw.get("retry_video_path") or "").strip()
+
+    if account_id:
+        identity = get_tencent_account_identity()
+        if not identity.success:
+            return [
+                WorkflowResult(
+                    ok=False,
+                    action="failed",
+                    error=f"发布账号验证失败：{identity.error}",
+                ).to_dict()
+            ]
+        if account_nickname and account_nickname not in identity.names:
+            actual_name = identity.nickname or identity.global_nickname or "未知账号"
+            return [
+                WorkflowResult(
+                    ok=False,
+                    action="failed",
+                    error=f"发布账号不匹配：任务选择“{account_name or account_nickname}”，"
+                    f"但腾讯频道 CLI 当前识别为“{actual_name}”。已停止发布，避免发到错误账号。",
+                ).to_dict()
+            ]
+        if not account_name:
+            account_name = identity.nickname or identity.global_nickname
 
     source_dirs = input_dirs if selection_order == "random" and input_dirs else [input_dir]
     existing_source_dirs = [path for path in source_dirs if path.exists() and path.is_dir()]
@@ -626,41 +658,43 @@ def run_publish_from_app_config(app_config_path: Path) -> list[dict[str, Any]]:
                 error="发布后未返回分享链接，已按失败处理，请稍后重新发布。",
             )
         if not result.success:
-            add_entry(
-                history,
-                SyncHistoryEntry(
-                    task_name=task_name,
-                    content_id=content_id,
-                    site=str(sidecar.get("site", "")),
-                    author=str(sidecar.get("author", "")),
-                    desc=str(sidecar.get("desc", "")) or title,
-                    output_path=str(video_path),
-                    status="failed",
-                    error=result.error,
-                    account_id=account_id,
-                    account_name=account_name,
-                ),
-            )
-            payload.append(
-                WorkflowResult(ok=False, action="failed", path=str(video_path), content_id=content_id, title=title, error=result.error).to_dict()
-            )
-            continue
-        add_entry(
-            history,
-            SyncHistoryEntry(
+            failed_entry = SyncHistoryEntry(
                 task_name=task_name,
                 content_id=content_id,
                 site=str(sidecar.get("site", "")),
                 author=str(sidecar.get("author", "")),
-                desc=str(sidecar.get("desc", "")),
+                desc=title,
                 output_path=str(video_path),
-                feed_id=result.feed_id,
-                share_url=result.share_url,
-                status="ok",
+                status="failed",
+                error=result.error,
                 account_id=account_id,
                 account_name=account_name,
-            ),
+            )
+            if retry_video_path:
+                replace_entry(history, failed_entry)
+            else:
+                add_entry(history, failed_entry)
+            payload.append(
+                WorkflowResult(ok=False, action="failed", path=str(video_path), content_id=content_id, title=title, error=result.error).to_dict()
+            )
+            continue
+        success_entry = SyncHistoryEntry(
+            task_name=task_name,
+            content_id=content_id,
+            site=str(sidecar.get("site", "")),
+            author=str(sidecar.get("author", "")),
+            desc=title,
+            output_path=str(video_path),
+            feed_id=result.feed_id,
+            share_url=result.share_url,
+            status="ok",
+            account_id=account_id,
+            account_name=account_name,
         )
+        if retry_video_path:
+            replace_content_entries(history, success_entry)
+        else:
+            add_entry(history, success_entry)
         if delete_after_publish:
             video_path.unlink(missing_ok=True)
             video_path.with_suffix(".json").unlink(missing_ok=True)
