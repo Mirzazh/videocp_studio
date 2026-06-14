@@ -2,7 +2,8 @@ import time
 from pathlib import Path
 from threading import Lock
 
-from videocp.app import DownloadOptions, StartIntervalGate, _exclude_processed_inputs, dedupe_prepared_inputs, download_jobs, prepare_link_list, read_input_file
+from videocp.app import DownloadOptions, StartIntervalGate, _exclude_processed_inputs, _run_download_jobs, dedupe_prepared_inputs, download_jobs, prepare_link_list, read_input_file
+from videocp.errors import DownloadError
 from videocp.models import DownloadArtifact, ExtractionResult, MediaCandidate, MediaKind, ParsedInput, TrackType, VideoMetadata, WatermarkMode
 
 
@@ -109,6 +110,83 @@ def test_start_interval_gate_enforces_spacing():
     gate.wait()
     elapsed = time.monotonic() - started
     assert elapsed >= 0.05
+
+
+def test_xiaohongshu_ytdlp_failure_falls_back_per_video(tmp_path: Path, monkeypatch):
+    prepared = [
+        ParsedInput(
+            raw_input=f"https://www.xiaohongshu.com/explore/note-{index}",
+            extracted_url=f"https://www.xiaohongshu.com/explore/note-{index}",
+            canonical_url=f"https://www.xiaohongshu.com/explore/note-{index}",
+            provider_key="ytdlp",
+            author_hint="章鱼科普1号",
+            fallback_provider_key="xiaohongshu",
+        )
+        for index in range(2)
+    ]
+    ytdlp_attempts: list[str] = []
+    native_attempts: list[str] = []
+
+    def fake_ytdlp(**kwargs):
+        ytdlp_attempts.append(kwargs["parsed"].canonical_url)
+        raise DownloadError("No video formats found")
+
+    def fake_native(parsed, browser_config, timeout_secs):
+        native_attempts.append(parsed.canonical_url)
+        content_id = parsed.canonical_url.rsplit("/", 1)[-1]
+        return ExtractionResult(
+            metadata=VideoMetadata(
+                source_url=parsed.canonical_url,
+                canonical_url=parsed.canonical_url,
+                site="xiaohongshu",
+                aweme_id=content_id,
+                author="",
+                title=f"笔记 {content_id}",
+            ),
+            candidates=[
+                MediaCandidate(
+                    url=f"https://cdn.example.com/{content_id}.mp4",
+                    kind=MediaKind.MP4,
+                    track_type=TrackType.MUXED,
+                    watermark_mode=WatermarkMode.UNKNOWN,
+                    source="xiaohongshu",
+                    observed_via="response",
+                )
+            ],
+            cookies=[],
+            user_agent="test",
+            diagnostics={},
+        )
+
+    def fake_artifact(extraction, output_dir, timeout_secs, watermark=None):
+        content_id = extraction.metadata.content_id
+        output_path = output_dir / f"{content_id}.mp4"
+        output_path.write_bytes(b"video")
+        return DownloadArtifact(
+            output_path=output_path,
+            sidecar_path=output_path.with_suffix(".json"),
+            chosen_candidate=extraction.candidates[0],
+            attempts=[{"status": "ok"}],
+        )
+
+    monkeypatch.setattr("videocp.app._download_ytdlp_input", fake_ytdlp)
+    monkeypatch.setattr("videocp.app._download_prepared_input", fake_native)
+    monkeypatch.setattr("videocp.app._download_extraction_artifact", fake_artifact)
+
+    results = _run_download_jobs(
+        prepared_inputs=prepared,
+        browser_config=object(),
+        output_dir=tmp_path,
+        timeout_secs=30,
+        max_concurrent=1,
+        max_concurrent_per_site=1,
+        start_interval_secs=0,
+    )
+
+    assert ytdlp_attempts == [item.canonical_url for item in prepared]
+    assert native_attempts == [item.canonical_url for item in prepared]
+    assert all(result.ok for result in results)
+    assert [result.extraction.metadata.author for result in results] == ["章鱼科普1号", "章鱼科普1号"]
 
 
 def test_download_jobs_respects_per_site_limit(tmp_path: Path, monkeypatch):

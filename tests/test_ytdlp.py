@@ -169,6 +169,46 @@ def test_app_force_redownload_replaces_existing_file(tmp_path: Path, monkeypatch
     assert target.read_bytes() == b"new"
 
 
+def test_app_ytdlp_profile_download_uses_profile_author_for_output_dir(tmp_path: Path, monkeypatch):
+    parsed = ParsedInput(
+        raw_input="https://www.xiaohongshu.com/explore/abc",
+        extracted_url="https://www.xiaohongshu.com/explore/abc",
+        canonical_url="https://www.xiaohongshu.com/explore/abc",
+        provider_key="ytdlp",
+        author_hint="章鱼科普1号",
+    )
+    monkeypatch.setattr(
+        app,
+        "fetch_ytdlp_metadata",
+        lambda *args, **kwargs: ytdlp.YtdlpMetadata(
+            id="abc",
+            title="测试视频",
+            uploader="6229bfb0000000001000693b",
+            site="xiaohongshu",
+            url=parsed.canonical_url,
+            formats_count=3,
+        ),
+    )
+
+    def fake_download_with_ytdlp(*, output_path: Path, **kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"video")
+
+    monkeypatch.setattr(app, "download_with_ytdlp", fake_download_with_ytdlp)
+    monkeypatch.setattr(app, "probe_video_dimensions", lambda path: (720, 1280))
+
+    extraction, artifact = app._download_ytdlp_input(
+        parsed=parsed,
+        browser_config=SimpleNamespace(),
+        output_dir=tmp_path,
+        timeout_secs=30,
+    )
+
+    assert extraction.metadata.author == "章鱼科普1号"
+    assert artifact.output_path.parent.name == "xiaohongshu-章鱼科普1号"
+    assert '"author": "章鱼科普1号"' in artifact.sidecar_path.read_text(encoding="utf-8")
+
+
 def test_app_retries_low_quality_youtube_metadata_with_web_safari(tmp_path: Path, monkeypatch):
     parsed = ParsedInput(
         raw_input="https://www.youtube.com/watch?v=abc",
@@ -686,5 +726,6 @@ def test_app_xiaohongshu_profile_videos_use_single_video_ytdlp_path(monkeypatch)
     )
 
     assert result[0].provider_key == "ytdlp"
+    assert result[0].fallback_provider_key == "xiaohongshu"
     assert result[0].canonical_url == note_url
     assert result[0].author_hint == "章鱼科普1号"

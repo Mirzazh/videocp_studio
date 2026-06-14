@@ -373,13 +373,23 @@ def _expand_profile_inputs(
                         "小红书主页没有解析到可下载的视频。请确认已经登录、主页中存在视频笔记，然后重试。"
                     )
                 for url in result.pinned_urls:
+                    provider_key = (
+                        "ytdlp"
+                        if profile_input.provider_key == "xiaohongshu"
+                        else profile_input.provider_key
+                    )
                     expanded.append(ParsedInput(
                         raw_input=url,
                         extracted_url=url,
                         canonical_url=url,
-                        provider_key=profile_input.provider_key,
+                        provider_key=provider_key,
                         is_pinned=True,
                         author_hint=result.author,
+                        fallback_provider_key=(
+                            "xiaohongshu"
+                            if profile_input.provider_key == "xiaohongshu"
+                            else ""
+                        ),
                     ))
                 for url in result.video_urls:
                     provider_key = (
@@ -393,6 +403,11 @@ def _expand_profile_inputs(
                         canonical_url=url,
                         provider_key=provider_key,
                         author_hint=result.author,
+                        fallback_provider_key=(
+                            "xiaohongshu"
+                            if profile_input.provider_key == "xiaohongshu"
+                            else ""
+                        ),
                     ))
 
     # yt-dlp profiles: playlist expansion via yt-dlp (or browser for Instagram)
@@ -634,7 +649,7 @@ def _download_ytdlp_input(
         canonical_url=parsed.canonical_url,
         page_url=parsed.canonical_url,
         aweme_id=meta.id,
-        author=meta.uploader,
+        author=parsed.author_hint or meta.uploader,
         desc=meta.title,
         title=meta.title,
         duration_ms=int(meta.duration_secs * 1000) if meta.duration_secs > 0 else 0,
@@ -816,7 +831,11 @@ def _run_download_jobs(
     def worker(index: int, parsed: ParsedInput, semaphore: threading.Semaphore) -> None:
         extraction: ExtractionResult | None = None
         try:
-            if parsed.provider_key == "ytdlp" and ytdlp_setup_failed.is_set():
+            is_youtube_job = (
+                "youtube.com" in parsed.canonical_url.lower()
+                or "youtu.be" in parsed.canonical_url.lower()
+            )
+            if parsed.provider_key == "ytdlp" and is_youtube_job and ytdlp_setup_failed.is_set():
                 results[index] = DownloadJobResult(
                     raw_input=parsed.raw_input,
                     parsed_input=parsed,
@@ -846,7 +865,56 @@ def _run_download_jobs(
                 }
                 if max_video_duration_secs > 0:
                     kwargs["max_video_duration_secs"] = max_video_duration_secs
-                extraction, artifact = _download_ytdlp_input(**kwargs)
+                try:
+                    extraction, artifact = _download_ytdlp_input(**kwargs)
+                except DownloadError as ytdlp_error:
+                    if not parsed.fallback_provider_key:
+                        raise
+                    log_warn(
+                        "ytdlp.download.fallback_native",
+                        site=parsed.fallback_provider_key,
+                        url=full_url(parsed.canonical_url),
+                        error=str(ytdlp_error),
+                    )
+                    fallback_input = ParsedInput(
+                        raw_input=parsed.raw_input,
+                        extracted_url=parsed.extracted_url,
+                        canonical_url=parsed.canonical_url,
+                        provider_key=parsed.fallback_provider_key,
+                        author_hint=parsed.author_hint,
+                    )
+                    extraction = _download_prepared_input(
+                        parsed=fallback_input,
+                        browser_config=browser_config,
+                        timeout_secs=timeout_secs,
+                    )
+                    if parsed.author_hint:
+                        extraction.metadata.author = parsed.author_hint
+                    existing = (
+                        None
+                        if force_redownload
+                        else _find_existing_download(output_dir, extraction.metadata.content_id)
+                    )
+                    if existing:
+                        candidate = extraction.candidates[0] if extraction.candidates else MediaCandidate(
+                            url=parsed.canonical_url,
+                            kind=MediaKind.MP4,
+                            track_type=TrackType.UNKNOWN,
+                            watermark_mode=WatermarkMode.UNKNOWN,
+                            source="reuse",
+                            observed_via="sidecar",
+                        )
+                        artifact = _artifact_from_existing(existing, candidate)
+                    else:
+                        artifact_kwargs = {
+                            "extraction": extraction,
+                            "output_dir": output_dir,
+                            "timeout_secs": timeout_secs,
+                            "watermark": watermark,
+                        }
+                        if max_video_duration_secs > 0:
+                            artifact_kwargs["max_video_duration_secs"] = max_video_duration_secs
+                        artifact = _download_extraction_artifact(**artifact_kwargs)
                 results[index] = DownloadJobResult(
                     raw_input=parsed.raw_input,
                     parsed_input=parsed,
@@ -973,7 +1041,14 @@ def _run_download_jobs(
                     output=artifact.output_path,
                 )
         except Exception as exc:
-            if parsed.provider_key == "ytdlp" and _is_ytdlp_setup_error(str(exc)):
+            if (
+                parsed.provider_key == "ytdlp"
+                and (
+                    "youtube.com" in parsed.canonical_url.lower()
+                    or "youtu.be" in parsed.canonical_url.lower()
+                )
+                and _is_ytdlp_setup_error(str(exc))
+            ):
                 ytdlp_setup_failed.set()
             results[index] = DownloadJobResult(
                 raw_input=parsed.raw_input,

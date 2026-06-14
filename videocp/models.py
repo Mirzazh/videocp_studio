@@ -33,6 +33,7 @@ class ParsedInput:
     is_profile: bool = False
     is_pinned: bool = False
     author_hint: str = ""
+    fallback_provider_key: str = ""
 
 
 @dataclass(slots=True)
